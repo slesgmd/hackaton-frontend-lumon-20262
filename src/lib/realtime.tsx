@@ -98,9 +98,16 @@ export function RealtimeProvider({ children }: { children: ReactNode }): JSX.Ele
     };
   }, [emit]);
 
+  const cleared = user?.clearance.granted === true;
+
   useEffect(() => {
     if (authStatus !== "authenticated") {
       setStatus("closed");
+      return;
+    }
+    // No se abre ningún stream hasta que /auth/me indique clearance.granted.
+    if (!cleared) {
+      setStatus("unavailable");
       return;
     }
 
@@ -261,7 +268,7 @@ export function RealtimeProvider({ children }: { children: ReactNode }): JSX.Ele
       abort.abort();
       setStatus("closed");
     };
-  }, [authStatus, emit, logout, user?.id]);
+  }, [authStatus, cleared, emit, logout, user?.id]);
 
   const ack = useCallback(async () => {
     if (!contingency) return;
