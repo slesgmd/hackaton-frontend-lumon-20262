@@ -6,9 +6,9 @@ function required(name: string, fallback?: string): string {
 }
 
 export const env = {
-  apiBaseUrl: required("VITE_API_BASE_URL", "https://lumon-api.vercel.app/api/v1").replace(/\/$/, ""),
-  wsBaseUrl: required("VITE_WS_BASE_URL", "wss://lumon-api.vercel.app/api/v1").replace(/\/$/, ""),
-  build: (import.meta.env.VITE_LUMON_BUILD ?? __LUMON_BUILD__ ?? "dev").trim() || "dev",
+  apiBaseUrl: required("VITE_API_BASE_URL").replace(/\/$/, ""),
+  wsBaseUrl: required("VITE_WS_BASE_URL").replace(/\/$/, ""),
+  build: __LUMON_BUILD__,
   storageProvider: (import.meta.env.VITE_STORAGE_PROVIDER ?? "SUPABASE").toUpperCase(),
   supabaseUrl: (import.meta.env.VITE_SUPABASE_URL ?? "").replace(/\/$/, ""),
   supabaseKey: import.meta.env.VITE_SUPABASE_ANON_KEY ?? "",

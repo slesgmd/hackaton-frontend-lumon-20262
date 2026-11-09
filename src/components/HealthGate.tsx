@@ -1,42 +1,54 @@
-import { useEffect, useState } from "react";
-import { apiRequest, isApiError } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { apiRequest } from "../lib/api";
 
 type Health = "checking" | "ok" | "down";
 
+const DELAYS = [1000, 2000, 4000, 8000, 15000];
+
+function nextDelay(failures: number): number {
+  const base = DELAYS[Math.min(failures - 1, DELAYS.length - 1)] ?? 15000;
+  return Math.round(base * (0.85 + Math.random() * 0.3));
+}
+
 export function HealthGate({ children }: { children: React.ReactNode }): JSX.Element {
   const [health, setHealth] = useState<Health>("checking");
-  const [attempt, setAttempt] = useState(0);
-  const [manual, setManual] = useState(0);
+  const [secondsLeft, setSecondsLeft] = useState(0);
+  const timer = useRef<number>(0);
+  const ticker = useRef<number>(0);
+  const failures = useRef(0);
+  const alive = useRef(true);
+
+  const clearTimers = useCallback((): void => {
+    window.clearTimeout(timer.current);
+    window.clearInterval(ticker.current);
+  }, []);
+
+  const check = useCallback(async (): Promise<void> => {
+    clearTimers();
+    setHealth((current) => (current === "ok" ? current : "checking"));
+    setSecondsLeft(0);
+    try {
+      await apiRequest<unknown>("/meta/health", { anonymous: true, retries: 0, skipAuthRefresh: true });
+      if (alive.current) setHealth("ok");
+    } catch {
+      if (!alive.current) return;
+      failures.current += 1;
+      const wait = nextDelay(failures.current);
+      setHealth("down");
+      setSecondsLeft(Math.ceil(wait / 1000));
+      ticker.current = window.setInterval(() => setSecondsLeft((value) => Math.max(0, value - 1)), 1000);
+      timer.current = window.setTimeout(() => void check(), wait);
+    }
+  }, [clearTimers]);
 
   useEffect(() => {
-    let cancelled = false;
-    let timer = 0;
-    let failures = 0;
-
-    const check = async (): Promise<void> => {
-      try {
-        await apiRequest<{ status: string }>("/meta/health", { anonymous: true, retries: 0, skipAuthRefresh: true });
-        if (!cancelled) setHealth("ok");
-      } catch (error) {
-        if (cancelled) return;
-        if (isApiError(error) && error.status >= 400 && error.status < 500) {
-          setHealth("ok");
-          return;
-        }
-        failures += 1;
-        setHealth("down");
-        const wait = Math.min(15000, 1000 * 2 ** failures);
-        timer = window.setTimeout(() => void check(), wait);
-      }
-    };
-
-    setHealth("checking");
+    alive.current = true;
     void check();
     return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
+      alive.current = false;
+      clearTimers();
     };
-  }, [attempt, manual]);
+  }, [check, clearTimers]);
 
   if (health === "ok") return <>{children}</>;
 
@@ -44,17 +56,17 @@ export function HealthGate({ children }: { children: React.ReactNode }): JSX.Ele
     <main className="flex min-h-screen items-center justify-center bg-lumon-ink p-6">
       <div className="w-full max-w-md rounded-lg border border-lumon-line bg-lumon-panel p-8 text-center">
         <h1 className="text-lg font-semibold text-lumon-mint">Conectando con Lumon…</h1>
-        <p className="mt-3 text-sm text-lumon-mint/70">
+        <p className="mt-3 text-sm text-lumon-mint/70" role="status" aria-live="polite">
           {health === "down"
-            ? "La API no responde todavía. Reintentaremos automáticamente."
+            ? `La API no responde todavía. Reintentando en ${secondsLeft} s.`
             : "Verificando el estado del servicio."}
         </p>
         {health === "down" ? (
           <button
             type="button"
             onClick={() => {
-              setAttempt((value) => value + 1);
-              setManual((value) => value + 1);
+              failures.current = 0;
+              void check();
             }}
             className="mt-5 rounded bg-lumon-mint px-4 py-2 text-sm font-semibold text-lumon-ink"
           >

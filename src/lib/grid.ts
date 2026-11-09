@@ -66,7 +66,6 @@ export class TileStore {
   private inflight = new Map<string, Promise<DecodedTile | null>>();
   private controllers = new Map<string, AbortController>();
   private listeners = new Set<() => void>();
-  private wanted = new Set<string>();
   private pinned = new Set<string>();
   private gateUntil = 0;
   private disposed = false;
@@ -109,7 +108,6 @@ export class TileStore {
   }
 
   setWanted(keys: Set<string>): void {
-    this.wanted = keys;
     for (const [key, controller] of this.controllers) {
       if (!keys.has(key) && !this.pinned.has(key)) {
         controller.abort();

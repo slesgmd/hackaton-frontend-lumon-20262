@@ -39,7 +39,7 @@ export function fieldErrors(error: unknown): Record<string, string> {
   if (!isApiError(error)) return {};
   const details = error.details;
   if (typeof details !== "object" || details === null) return {};
-  const candidate = (details as ValidationErrorDetails).fieldErrors;
+  const candidate = (details as ValidationErrorDetails).fields;
   return candidate && typeof candidate === "object" ? candidate : {};
 }
 

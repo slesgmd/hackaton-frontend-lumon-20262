@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { fieldErrors, isApiError, messageFor } from "../lib/api";
 import { useAuth } from "../lib/auth";
+import { safeNext } from "../lib/nav";
 
 function errorField(error: unknown): string | null {
   if (!isApiError(error)) return null;
@@ -17,7 +18,7 @@ export function LoginPage(): JSX.Element {
   const { status, login, revokedMessage } = useAuth();
   const navigate = useNavigate();
   const [params] = useSearchParams();
-  const next = params.get("next") || "/files";
+  const next = safeNext(params.get("next"));
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -28,6 +29,7 @@ export function LoginPage(): JSX.Element {
 
   const onSubmit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
+    if (busy) return;
     setBusy(true);
     setError(null);
     setFieldError(null);
@@ -37,7 +39,10 @@ export function LoginPage(): JSX.Element {
     } catch (caught) {
       const fields = fieldErrors(caught);
       const field = errorField(caught) ?? Object.keys(fields)[0] ?? null;
-      if (field) setFieldError({ field, message: fields[field] ?? messageFor(caught) });
+      if (field) {
+        setFieldError({ field, message: fields[field] ?? messageFor(caught) });
+        window.setTimeout(() => document.getElementById(field)?.focus(), 0);
+      }
       else setError(messageFor(caught));
     } finally {
       setBusy(false);

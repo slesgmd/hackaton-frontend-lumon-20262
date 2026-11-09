@@ -64,7 +64,7 @@ export interface ApiErrorBody {
 }
 
 export interface ValidationErrorDetails {
-  fieldErrors?: Record<string, string>;
+  fields?: Record<string, string>;
 }
 
 export interface Progress {

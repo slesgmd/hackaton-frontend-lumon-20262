@@ -8,3 +8,6 @@ dist/
 .wrangler/
 *.log
 .DS_Store
+
+.dev.vars*
+!.dev.vars.example

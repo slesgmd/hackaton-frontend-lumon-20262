@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { apiRequest, isAbortError, isApiError, messageFor } from "../lib/api";
 import { useAuth } from "../lib/auth";
-import { BINS, BIN_CHAR, BIN_NAME, percent, readInt } from "../lib/format";
+import { BINS, BIN_NAME, percent, readInt } from "../lib/format";
 import { collectGroup, clampCell, TileStore, type GroupResult } from "../lib/grid";
 import { useFloor } from "../lib/floor";
 import { useRealtimeEvent } from "../lib/realtime";
@@ -362,7 +362,7 @@ export function RefinePage(): JSX.Element {
   );
 
   const onDragStart = useCallback(
-    (cell: CellRef, event: React.PointerEvent<HTMLDivElement>) => {
+    (_cell: CellRef, event: React.PointerEvent<HTMLDivElement>) => {
       if (!selection || selection.noise || !canRefine) return;
       event.preventDefault();
       setDrag({ x: event.clientX, y: event.clientY });

@@ -28,7 +28,7 @@ function ConnectionBadge(): JSX.Element {
 }
 
 export function Layout(): JSX.Element {
-  const { user, logout, hasPermission, isSupervisor } = useAuth();
+  const { user, logout, hasPermission } = useAuth();
   const navigate = useNavigate();
 
   const onLogout = async (): Promise<void> => {
@@ -63,7 +63,7 @@ export function Layout(): JSX.Element {
             <div className="text-right">
               <p className="text-sm text-lumon-mint">{user?.displayName ?? "—"}</p>
               <p className="font-mono text-[11px] text-lumon-mint/50">
-                {user?.team.code ?? ""} · {isSupervisor ? "Supervisor" : user?.role.name ?? ""}
+                {user?.team.code ?? ""} · {user?.role.name ?? ""}
               </p>
             </div>
             <button

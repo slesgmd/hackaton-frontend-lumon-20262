@@ -27,7 +27,6 @@ interface AuthContextValue {
   logout: () => Promise<void>;
   refreshMe: () => Promise<Me | null>;
   hasPermission: (permission: Permission) => boolean;
-  isSupervisor: boolean;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -59,8 +58,35 @@ function applyTokens(tokens: TokenPair): void {
 }
 
 let refreshInFlight: Promise<boolean> | null = null;
+let tokenStamp = 0;
+let notifyRevoked: ((code: string) => void) | null = null;
 
-async function refreshLocked(): Promise<boolean> {
+const REVOKED_CODES = new Set(["REFRESH_REUSED", "SESSION_REVOKED", "TOKEN_INVALID", "REFRESH_INVALID"]);
+
+const REVOKED_MESSAGES: Record<string, string> = {
+  REFRESH_REUSED:
+    "Se detectó que tu token de sesión se usó dos veces, así que por seguridad cerramos tu sesión en todas las pestañas. Inicia sesión de nuevo.",
+  SESSION_REVOKED: "Tu sesión fue revocada desde el servidor. Inicia sesión de nuevo.",
+  TOKEN_INVALID: "Tu credencial no es válida o es de otro equipo. Inicia sesión de nuevo.",
+  REFRESH_INVALID: "Tu sesión venció. Inicia sesión de nuevo.",
+};
+
+function revokedText(code: string): string {
+  return REVOKED_MESSAGES[code] ?? REVOKED_MESSAGES.SESSION_REVOKED ?? "";
+}
+
+function revoke(code: string): void {
+  session.clear();
+  writeRefreshToken(null);
+  channel?.postMessage({ type: "revoked", reason: code });
+  notifyRevoked?.(code);
+}
+
+/** Un único intento por refresh token; solo 429/503 se reintentan. Nunca se reusa un token tras error de red o 401. */
+async function refreshLocked(stamp: number): Promise<boolean> {
+  // Otra pestaña ya renovó mientras esperábamos el lock: usamos su access token.
+  if (tokenStamp !== stamp && session.getAccessToken()) return true;
+
   const current = readRefreshToken();
   if (!current) return false;
 
@@ -70,19 +96,15 @@ async function refreshLocked(): Promise<boolean> {
       response = await rawFetch("/auth/refresh", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refreshToken: readRefreshToken() ?? current }),
+        body: JSON.stringify({ refreshToken: current }),
       });
     } catch {
-      if (attempt < 2) {
-        await sleep(500 * 2 ** attempt);
-        continue;
-      }
       return false;
     }
 
     if (response.ok) {
       const tokens = (await response.json()) as TokenPair;
-      applyTokens(tokens);
+      applyTokens(tokens); // guarda el refresh nuevo antes de soltar el lock
       channel?.postMessage({ type: "tokens", tokens });
       return true;
     }
@@ -95,15 +117,14 @@ async function refreshLocked(): Promise<boolean> {
       /* sin cuerpo */
     }
 
-    if (code === "REFRESH_REUSED" || code === "SESSION_REVOKED" || code === "TOKEN_INVALID") {
-      session.clear();
-      writeRefreshToken(null);
-      channel?.postMessage({ type: "revoked", reason: code });
+    if (REVOKED_CODES.has(code) || response.status === 401) {
+      revoke(REVOKED_CODES.has(code) ? code : "REFRESH_INVALID");
       return false;
     }
 
-    if (response.status >= 500 && attempt < 2) {
-      await sleep(500 * 2 ** attempt);
+    if ((response.status === 429 || response.status === 503) && attempt < 2) {
+      const header = Number(response.headers.get("Retry-After"));
+      await sleep(Number.isFinite(header) && header > 0 ? header * 1000 : 500 * 2 ** attempt);
       continue;
     }
     return false;
@@ -113,12 +134,13 @@ async function refreshLocked(): Promise<boolean> {
 
 async function refreshSession(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight;
+  const stamp = tokenStamp;
 
   const run = async (): Promise<boolean> => {
     if (typeof navigator !== "undefined" && "locks" in navigator) {
-      return navigator.locks.request(LOCK_NAME, async () => refreshLocked());
+      return navigator.locks.request(LOCK_NAME, async () => refreshLocked(stamp));
     }
-    return refreshLocked();
+    return refreshLocked(stamp);
   };
 
   refreshInFlight = run().finally(() => {
@@ -134,25 +156,19 @@ if (typeof window !== "undefined" && "BroadcastChannel" in window) {
 
 interface BootResult {
   me: Me | null;
-  revoked: string | null;
 }
 
 let bootPromise: Promise<BootResult> | null = null;
 
 async function boot(): Promise<BootResult> {
-  if (!readRefreshToken()) return { me: null, revoked: null };
+  if (!readRefreshToken()) return { me: null };
   const ok = await refreshSession();
-  if (!ok) {
-    return {
-      me: null,
-      revoked: session.getAccessToken() === null && readRefreshToken() === null ? "SESSION_REVOKED" : null,
-    };
-  }
+  if (!ok) return { me: null };
   try {
     const me = await apiRequest<Me>("/auth/me");
-    return { me, revoked: null };
+    return { me };
   } catch {
-    return { me: null, revoked: null };
+    return { me: null };
   }
 }
 
@@ -165,12 +181,27 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
   useEffect(() => {
     mounted.current = true;
     setRefreshHandler(refreshSession);
-    setRevokedHandler((reason) => {
-      session.clear();
-      writeRefreshToken(null);
-      channel?.postMessage({ type: "revoked", reason });
-    });
+    setRevokedHandler((reason) => revoke(reason));
+    notifyRevoked = (code) => {
+      if (!mounted.current) return;
+      setUser(null);
+      setStatus("anonymous");
+      setRevokedMessage(revokedText(code));
+    };
+    const onStorage = (event: StorageEvent): void => {
+      // Respaldo si BroadcastChannel no existe: el refresh token desaparece = logout en otra pestaña.
+      if (event.key === REFRESH_KEY && event.newValue === null) {
+        session.clear();
+        if (mounted.current) {
+          setUser(null);
+          setStatus("anonymous");
+        }
+      }
+    };
+    window.addEventListener("storage", onStorage);
     return () => {
+      window.removeEventListener("storage", onStorage);
+      notifyRevoked = null;
       mounted.current = false;
       setRefreshHandler(null);
       setRevokedHandler(null);
@@ -187,9 +218,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
         setStatus("authenticated");
       } else {
         setStatus("anonymous");
-        if (result.revoked) {
-          setRevokedMessage("Tu sesión fue revocada. Inicia sesión de nuevo.");
-        }
+        
       }
     });
     return () => {
@@ -207,6 +236,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
       if (type === "tokens") {
         const tokens = record.tokens as TokenPair | undefined;
         if (tokens) {
+          tokenStamp += 1;
           applyTokens(tokens);
           if (mounted.current && status === "authenticated") {
             apiRequest<Me>("/auth/me")
@@ -229,7 +259,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
         if (mounted.current) {
           setUser(null);
           setStatus("anonymous");
-          setRevokedMessage("Tu sesión fue revocada. Inicia sesión de nuevo.");
+          setRevokedMessage(revokedText(String(record.reason ?? "SESSION_REVOKED")));
         }
       }
     };
@@ -244,7 +274,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
     setUser(me);
     setStatus("authenticated");
     setRevokedMessage(null);
-    bootPromise = Promise.resolve({ me, revoked: null });
+    bootPromise = Promise.resolve({ me });
     return me;
   }, []);
 
@@ -290,7 +320,7 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
     session.clear();
     writeRefreshToken(null);
     channel?.postMessage({ type: "logout" });
-    bootPromise = Promise.resolve({ me: null, revoked: null });
+    bootPromise = Promise.resolve({ me: null });
     setUser(null);
     setStatus("anonymous");
   }, []);
@@ -320,7 +350,6 @@ export function AuthProvider({ children }: { children: ReactNode }): JSX.Element
       logout,
       refreshMe,
       hasPermission,
-      isSupervisor: user?.role.code === "SUPERVISOR",
     }),
     [status, user, revokedMessage, login, register, logout, refreshMe, hasPermission],
   );
