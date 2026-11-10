@@ -17,6 +17,7 @@ const RefinePage = page(() => import("./pages/Refine"), "RefinePage");
 const RefinersPage = page(() => import("./pages/Refiners"), "RefinersPage");
 const RefinerDetailPage = page(() => import("./pages/RefinerDetail"), "RefinerDetailPage");
 const RefinerEditPage = page(() => import("./pages/RefinerEdit"), "RefinerEditPage");
+const EstadoPage = page(() => import("./pages/Estado"), "EstadoPage");
 const NotFoundPage = page(() => import("./pages/NotFound"), "NotFoundPage");
 
 function Shell({ title, children, full = false }: { title: string; children: ReactNode; full?: boolean }): JSX.Element {
@@ -141,7 +142,7 @@ export default function App(): JSX.Element {
           path="/estado"
           element={
             <Guarded title="Estado">
-              <Placeholder title="Estado" note="Disponible en el CP6." />
+              <EstadoPage />
             </Guarded>
           }
         />

@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { CellRef, FloorCursor } from "../lib/types";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type JSX } from "react";
+import { BIN_NAME, binFromChar } from "../lib/format";
 import { clampCell, type TileStore } from "../lib/grid";
+import { chooseCellSize, computeRange, inRange } from "../lib/viewport";
+import type { CellRef, FloorCursor } from "../lib/types";
 
-const CELL_SIZE = 24;
-const OVERSCAN = 2;
-const MAX_CELLS = 2500;
+const OVERSCAN = 3;
 
 interface ClaimInfo {
   userId: number;
@@ -20,27 +20,25 @@ interface VirtualGridProps {
   claims: Map<string, ClaimInfo>;
   cursors: FloorCursor[];
   focus: CellRef;
+  /** Celda que debe quedar arriba a la izquierda al abrir (viene de ?r=&c=). */
   initialCell: CellRef;
   onFocusChange: (cell: CellRef) => void;
   onSelect: (cell: CellRef) => void;
   onDragStart?: (cell: CellRef, event: React.PointerEvent<HTMLDivElement>) => void;
+  /** Celda arriba a la izquierda de la vista; el padre decide cuándo escribirla en la URL. */
   onPositionChange?: (cell: CellRef) => void;
-}
-
-function cellKey(r: number, c: number): string {
-  return `${r}:${c}`;
 }
 
 function binClass(bin: string): string {
   switch (bin) {
     case "W":
-      return "text-lumon-mint";
+      return "bg-lumon-mint/25 text-lumon-mint";
     case "F":
-      return "text-lumon-amber";
+      return "bg-lumon-amber/25 text-lumon-amber";
     case "D":
-      return "text-lumon-danger";
+      return "bg-lumon-danger/25 text-lumon-danger";
     case "M":
-      return "text-fuchsia-300";
+      return "bg-fuchsia-400/25 text-fuchsia-300";
     default:
       return "";
   }
@@ -62,16 +60,17 @@ export function VirtualGrid({
   onPositionChange,
 }: VirtualGridProps): JSX.Element {
   const viewportRef = useRef<HTMLDivElement | null>(null);
-  const [size, setSize] = useState({ width: 800, height: 520 });
-  const [scroll, setScroll] = useState({ top: 0, left: 0 });
+  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  const [scroll, setScroll] = useState<{ top: number; left: number } | null>(null);
   const [, setVersion] = useState(0);
-  const lastPosition = useRef(0);
-  const initialised = useRef(false);
+  const rafRef = useRef(0);
+  const hasFocus = useRef(false);
+  const lastPosition = useRef<string>("");
 
-  useEffect(() => {
-    const unsubscribe = store.subscribe(() => setVersion((value) => value + 1));
-    return unsubscribe;
-  }, [store]);
+  const cellSize = size ? chooseCellSize(size.width, size.height) : 28;
+
+  // Los bloques nuevos repintan la grilla (el store ya agrupa las notificaciones por frame).
+  useEffect(() => store.subscribe(() => setVersion((value) => value + 1)), [store]);
 
   useEffect(() => {
     const element = viewportRef.current;
@@ -79,97 +78,98 @@ export function VirtualGrid({
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry) return;
-      const { width, height } = entry.contentRect;
-      setSize({ width: Math.max(1, width), height: Math.max(1, height) });
+      setSize({ width: Math.max(1, Math.floor(entry.contentRect.width)), height: Math.max(1, Math.floor(entry.contentRect.height)) });
     });
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
 
-  const scrollToCell = (cell: CellRef, behavior: ScrollBehavior = "auto"): void => {
-    const element = viewportRef.current;
-    if (!element) return;
-    const x = cell.c * CELL_SIZE;
-    const y = cell.r * CELL_SIZE;
-    const margin = CELL_SIZE * 2;
-    let nextLeft = element.scrollLeft;
-    let nextTop = element.scrollTop;
-    if (x < element.scrollLeft + margin) nextLeft = Math.max(0, x - margin);
-    else if (x + CELL_SIZE > element.scrollLeft + element.clientWidth - margin)
-      nextLeft = x + CELL_SIZE - element.clientWidth + margin;
-    if (y < element.scrollTop + margin) nextTop = Math.max(0, y - margin);
-    else if (y + CELL_SIZE > element.scrollTop + element.clientHeight - margin)
-      nextTop = y + CELL_SIZE - element.clientHeight + margin;
-    if (nextLeft !== element.scrollLeft || nextTop !== element.scrollTop) {
-      element.scrollTo({ left: nextLeft, top: nextTop, behavior });
-    }
-  };
-
+  // Posición inicial: una sola vez, cuando ya conocemos el tamaño del contenedor.
+  const initialised = useRef(false);
   useEffect(() => {
-    if (initialised.current) return;
+    const element = viewportRef.current;
+    if (!size || !element || initialised.current) return;
     initialised.current = true;
-    scrollToCell(initialCell);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialCell.r, initialCell.c]);
+    element.scrollTo({ left: initialCell.c * cellSize, top: initialCell.r * cellSize });
+    setScroll({ top: element.scrollTop, left: element.scrollLeft });
+  }, [size, cellSize, initialCell.r, initialCell.c]);
+
+  // Throttle por requestAnimationFrame: un solo setState por frame, sin importar cuántos eventos de scroll.
+  const onScroll = useCallback((event: React.UIEvent<HTMLDivElement>): void => {
+    const target = event.currentTarget;
+    if (rafRef.current) return;
+    rafRef.current = window.requestAnimationFrame(() => {
+      rafRef.current = 0;
+      setScroll({ top: target.scrollTop, left: target.scrollLeft });
+    });
+  }, []);
+  useEffect(() => () => window.cancelAnimationFrame(rafRef.current), []);
 
   const range = useMemo(() => {
-    let startRow = Math.max(0, Math.floor(scroll.top / CELL_SIZE) - OVERSCAN);
-    let endRow = Math.min(rows - 1, Math.ceil((scroll.top + size.height) / CELL_SIZE) + OVERSCAN);
-    let startCol = Math.max(0, Math.floor(scroll.left / CELL_SIZE) - OVERSCAN);
-    let endCol = Math.min(cols - 1, Math.ceil((scroll.left + size.width) / CELL_SIZE) + OVERSCAN);
+    if (!size || !scroll) return null;
+    return computeRange({
+      scrollTop: scroll.top,
+      scrollLeft: scroll.left,
+      width: size.width,
+      height: size.height,
+      cellSize,
+      rows,
+      cols,
+      overscan: OVERSCAN,
+    });
+  }, [size, scroll, cellSize, rows, cols]);
 
-    while ((endRow - startRow + 1) * (endCol - startCol + 1) > MAX_CELLS) {
-      if (endRow - startRow >= endCol - startCol) endRow -= 1;
-      else endCol -= 1;
-    }
-
-    if (focus.r < startRow) {
-      const shift = startRow - focus.r;
-      startRow = Math.max(0, startRow - shift);
-      endRow = Math.max(startRow, endRow - shift);
-    } else if (focus.r > endRow) {
-      const shift = focus.r - endRow;
-      endRow = Math.min(rows - 1, endRow + shift);
-      startRow = Math.min(startRow, Math.max(0, startRow + shift));
-    }
-    if (focus.c < startCol) {
-      const shift = startCol - focus.c;
-      startCol = Math.max(0, startCol - shift);
-      endCol = Math.max(startCol, endCol - shift);
-    } else if (focus.c > endCol) {
-      const shift = focus.c - endCol;
-      endCol = Math.min(cols - 1, endCol + shift);
-      startCol = Math.min(startCol, Math.max(0, startCol + shift));
-    }
-
-    return { startRow, endRow, startCol, endCol };
-  }, [scroll.top, scroll.left, size.height, size.width, rows, cols, focus.r, focus.c]);
-
+  // Pide los bloques visibles y cancela los que salieron de la vista.
   useEffect(() => {
+    if (!range) return;
     const keys = store.visibleTileKeys(range.startRow, range.endRow, range.startCol, range.endCol);
     store.setWanted(keys);
     for (const key of keys) {
       const [row, col] = key.split(":");
       if (row !== undefined && col !== undefined) void store.load(Number(row), Number(col));
     }
-  }, [store, range.startRow, range.endRow, range.startCol, range.endCol]);
+  }, [store, range]);
 
   useEffect(() => {
-    const now = Date.now();
-    if (now - lastPosition.current < 250) return;
-    lastPosition.current = now;
-    const centerRow = Math.floor((scroll.top + size.height / 2) / CELL_SIZE);
-    const centerCol = Math.floor((scroll.left + size.width / 2) / CELL_SIZE);
-    onPositionChange?.(clampCell(centerRow, centerCol, rows, cols));
-  }, [scroll.top, scroll.left, size.height, size.width, rows, cols, onPositionChange]);
+    if (!scroll) return;
+    const cell = clampCell(Math.floor(scroll.top / cellSize), Math.floor(scroll.left / cellSize), rows, cols);
+    const id = `${cell.r}:${cell.c}`;
+    if (id === lastPosition.current) return;
+    lastPosition.current = id;
+    onPositionChange?.(cell);
+  }, [scroll, cellSize, rows, cols, onPositionChange]);
 
-  const onScroll = (event: React.UIEvent<HTMLDivElement>): void => {
-    const target = event.currentTarget;
-    setScroll({ top: target.scrollTop, left: target.scrollLeft });
-  };
+  const scrollToCell = useCallback(
+    (cell: CellRef): void => {
+      const element = viewportRef.current;
+      if (!element) return;
+      const x = cell.c * cellSize;
+      const y = cell.r * cellSize;
+      let left = element.scrollLeft;
+      let top = element.scrollTop;
+      if (x < left) left = x;
+      else if (x + cellSize > left + element.clientWidth) left = x + cellSize - element.clientWidth;
+      if (y < top) top = y;
+      else if (y + cellSize > top + element.clientHeight) top = y + cellSize - element.clientHeight;
+      if (left !== element.scrollLeft || top !== element.scrollTop) element.scrollTo({ left, top });
+    },
+    [cellSize],
+  );
+
+  // El foco (por teclado, por "Ir a…" o por URL) siempre queda visible.
+  useEffect(() => {
+    if (initialised.current) scrollToCell(focus);
+  }, [focus.r, focus.c, scrollToCell, focus]);
+
+  // Roving tabindex: si la grilla tiene el foco, el DOM sigue a la celda activa.
+  useEffect(() => {
+    if (!hasFocus.current) return;
+    const element = document.getElementById(`cell-${focus.r}-${focus.c}`);
+    if (element && document.activeElement !== element) element.focus({ preventScroll: true });
+  });
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>): void => {
-    const pageRows = Math.max(1, Math.floor(size.height / CELL_SIZE) - 2);
+    const pageRows = Math.max(1, Math.floor((size?.height ?? 400) / cellSize) - 1);
     let next: CellRef | null = null;
     switch (event.key) {
       case "ArrowUp":
@@ -191,10 +191,10 @@ export function VirtualGrid({
         next = { r: focus.r + pageRows, c: focus.c };
         break;
       case "Home":
-        next = { r: focus.r, c: 0 };
+        next = event.ctrlKey ? { r: 0, c: 0 } : { r: focus.r, c: 0 };
         break;
       case "End":
-        next = { r: focus.r, c: cols - 1 };
+        next = event.ctrlKey ? { r: rows - 1, c: cols - 1 } : { r: focus.r, c: cols - 1 };
         break;
       case "Enter":
       case " ":
@@ -210,67 +210,98 @@ export function VirtualGrid({
     scrollToCell(clamped);
   };
 
-  const cells: JSX.Element[] = [];
-  for (let r = range.startRow; r <= range.endRow; r += 1) {
-    for (let c = range.startCol; c <= range.endCol; c += 1) {
-      const key = cellKey(r, c);
+  // Filas con role="row": rango visible + la celda con foco aunque quede fuera del rango.
+  const rowElements: JSX.Element[] = [];
+  if (range) {
+    const cellsByRow = new Map<number, JSX.Element[]>();
+    const push = (r: number, element: JSX.Element): void => {
+      const list = cellsByRow.get(r);
+      if (list) list.push(element);
+      else cellsByRow.set(r, [element]);
+    };
+
+    const renderCell = (r: number, c: number): JSX.Element => {
       const cell = store.getCell(r, c);
+      const key = `${r}:${c}`;
       const isFocus = focus.r === r && focus.c === c;
       const isSelected = selected.has(key);
       const claim = claims.get(key);
-      const scary = cell ? cell.tremor >= threshold : false;
-      const bin = cell?.bin ?? ".";
-      const reducedDuration = cell ? Math.max(120, 620 - cell.tremor * 4) : 300;
+      const refinedBin = cell && cell.bin !== "." ? binFromChar(cell.bin) : null;
+      const scary = Boolean(cell) && cell !== null && cell.tremor >= threshold && cell.bin === ".";
+      const amplitude = cell ? 0.3 + (cell.tremor / 100) * 1.6 : 0;
+      const state = !cell
+        ? "sin cargar"
+        : refinedBin
+          ? `refinada en ${BIN_NAME[refinedBin]}`
+          : scary
+            ? "da miedo"
+            : "normal";
+      const label = cell
+        ? `Fila ${r + 1}, columna ${c + 1}, dígito ${cell.digit}, temblor ${cell.tremor}, ${state}${isSelected ? ", en el grupo seleccionado" : ""}${claim ? `, reservada por ${claim.displayName}` : ""}`
+        : `Fila ${r + 1}, columna ${c + 1}, sin cargar`;
+      const style: CSSProperties & Record<string, string | number | undefined> = {
+        left: c * cellSize,
+        width: cellSize,
+        height: cellSize,
+        cursor: isSelected && onDragStart ? "grab" : scary ? "pointer" : "default",
+      };
+      if (scary) style["--amp"] = `${amplitude.toFixed(2)}px`;
 
-      cells.push(
+      return (
         <div
           key={key}
           id={`cell-${r}-${c}`}
           role="gridcell"
-          aria-rowindex={r + 1}
           aria-colindex={c + 1}
           aria-selected={isSelected}
-          aria-label={`Fila ${r + 1}, columna ${c + 1}${cell ? `, dígito ${cell.digit}, temblor ${cell.tremor}` : ", sin cargar"}`}
-          tabIndex={-1}
+          aria-label={label}
+          tabIndex={isFocus ? 0 : -1}
           onClick={() => {
             onFocusChange({ r, c });
             onSelect({ r, c });
           }}
-          onDoubleClick={() => onSelect({ r, c })}
           onPointerDown={(event) => {
             if (isSelected && onDragStart) onDragStart({ r, c }, event);
           }}
           className={[
-            "absolute flex select-none items-center justify-center border border-lumon-line/30 font-mono text-[11px]",
-            cell ? (scary ? "bg-lumon-mint/10 text-lumon-mint" : "text-lumon-mint/35") : "bg-lumon-panel/30 text-transparent",
-            scary ? "motion-safe:animate-tremor" : "",
-            binClass(bin),
+            "absolute top-0 flex select-none items-center justify-center border border-lumon-line/30 font-mono text-[11px]",
+            !cell ? "bg-lumon-panel/40 text-transparent" : "",
+            cell && !scary && !refinedBin ? "text-lumon-mint/35" : "",
+            scary ? "cell-scary cell-tremor bg-lumon-mint/10 text-lumon-mint" : "",
+            refinedBin ? binClass(cell?.bin ?? ".") : "",
             isSelected ? "z-10 ring-2 ring-inset ring-lumon-amber" : "",
             claim && !isSelected ? "ring-1 ring-inset ring-lumon-danger/80" : "",
-            isFocus ? "outline outline-2 -outline-offset-2 outline-white" : "",
+            isFocus ? "z-20 outline outline-2 -outline-offset-2 outline-white" : "",
           ].join(" ")}
-          style={{
-            left: c * CELL_SIZE,
-            top: r * CELL_SIZE,
-            width: CELL_SIZE,
-            height: CELL_SIZE,
-            animationDuration: scary ? `${reducedDuration}ms` : undefined,
-            cursor: isSelected && onDragStart ? "grab" : "pointer",
-          }}
+          style={style}
         >
-          {cell ? (scary ? cell.digit : cell.digit) : ""}
-          {claim ? (
-            <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-lumon-danger" aria-hidden="true" />
-          ) : null}
+          {cell ? cell.digit : ""}
+          {claim ? <span className="absolute -right-0.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-lumon-danger" aria-hidden="true" /> : null}
+        </div>
+      );
+    };
+
+    for (let r = range.startRow; r <= range.endRow; r += 1) {
+      for (let c = range.startCol; c <= range.endCol; c += 1) push(r, renderCell(r, c));
+    }
+    if (!inRange(range, focus.r, focus.c)) push(focus.r, renderCell(focus.r, focus.c));
+
+    for (const r of [...cellsByRow.keys()].sort((a, b) => a - b)) {
+      rowElements.push(
+        <div
+          key={r}
+          role="row"
+          aria-rowindex={r + 1}
+          className="absolute left-0"
+          style={{ top: r * cellSize, width: cols * cellSize, height: cellSize }}
+        >
+          {cellsByRow.get(r)}
         </div>,
       );
     }
   }
 
-  const visibleCursors = cursors.filter(
-    (cursor) =>
-      cursor.r >= range.startRow && cursor.r <= range.endRow && cursor.c >= range.startCol && cursor.c <= range.endCol,
-  );
+  const visibleCursors = range ? cursors.filter((cursor) => inRange(range, cursor.r, cursor.c)) : [];
 
   return (
     <div
@@ -279,19 +310,23 @@ export function VirtualGrid({
       aria-rowcount={rows}
       aria-colcount={cols}
       aria-label="Grilla de macrodata"
-      aria-activedescendant={`cell-${focus.r}-${focus.c}`}
-      tabIndex={0}
       onKeyDown={onKeyDown}
       onScroll={onScroll}
-      className="relative max-h-[70vh] overflow-auto rounded border border-lumon-line bg-lumon-ink outline-none focus-visible:ring-1 focus-visible:ring-lumon-mint"
+      onFocus={() => {
+        hasFocus.current = true;
+      }}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) hasFocus.current = false;
+      }}
+      className="relative h-[70vh] min-h-[320px] overflow-auto rounded border border-lumon-line bg-lumon-ink"
     >
-      <div style={{ width: cols * CELL_SIZE, height: rows * CELL_SIZE, position: "relative" }}>
-        {cells}
+      <div style={{ width: cols * cellSize, height: rows * cellSize, position: "relative" }}>
+        {rowElements}
         {visibleCursors.map((cursor) => (
           <div
             key={`cursor-${cursor.userId}`}
-            className="pointer-events-none absolute z-20 rounded border border-lumon-amber/80 bg-lumon-amber/20 px-1 text-[9px] text-lumon-amber"
-            style={{ left: cursor.c * CELL_SIZE, top: cursor.r * CELL_SIZE }}
+            className="pointer-events-none absolute z-30 rounded border border-lumon-amber/80 bg-lumon-amber/20 px-1 text-[9px] text-lumon-amber"
+            style={{ left: cursor.c * cellSize, top: cursor.r * cellSize }}
             aria-hidden="true"
           >
             {cursor.displayName?.slice(0, 8) ?? `U${cursor.userId}`}

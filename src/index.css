@@ -14,3 +14,34 @@ body {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* Temblor: solo transform. La amplitud sale de --amp (proporcional al tremor de cada celda). */
+@keyframes lumon-tremor {
+  0%, 100% { transform: translate(0, 0); }
+  25% { transform: translate(var(--amp, 0.5px), calc(var(--amp, 0.5px) * -1)); }
+  50% { transform: translate(calc(var(--amp, 0.5px) * -1), calc(var(--amp, 0.5px) * 0.6)); }
+  75% { transform: translate(calc(var(--amp, 0.5px) * 0.6), var(--amp, 0.5px)); }
+}
+
+/* Se distingue por algo más que el color: negrita y subrayado, con o sin movimiento. */
+.cell-scary {
+  font-weight: 700;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 2px;
+}
+
+.cell-tremor {
+  animation: lumon-tremor 200ms linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cell-tremor {
+    animation: none !important;
+  }
+  .cell-scary {
+    border-style: double;
+    border-width: 3px;
+    border-color: #7ef0c0;
+  }
+}

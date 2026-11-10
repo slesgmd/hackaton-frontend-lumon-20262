@@ -107,7 +107,7 @@ export interface Rules {
   minGroupSize: number;
   maxGroupSize: number;
   binning: {
-    strategy: "DIGIT_SUM_MOD" | "MAX_DIGIT_MOD";
+    strategy: string;
     order: Bin[];
   };
 }

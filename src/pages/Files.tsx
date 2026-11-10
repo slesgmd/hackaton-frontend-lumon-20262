@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { apiRequest, isAbortError, messageFor } from "../lib/api";
 import { formatDate, percent, readInt } from "../lib/format";
 import { useRealtimeEvent } from "../lib/realtime";
+import { FilePageSchema } from "../lib/schemas";
 import type { DataFile, FilePage, FileStatus } from "../lib/types";
 import { ErrorNotice, Loading } from "../components/Loading";
 
@@ -36,7 +37,7 @@ export function FilesPage(): JSX.Element {
   const status: FileStatus | "" = statusParam === "ACTIVE" || statusParam === "COMPLETE" ? statusParam : "";
   const sortParam = params.get("sort") ?? "updatedAt,desc";
   const sort = (SORTS as readonly string[]).includes(sortParam) ? sortParam : "updatedAt,desc";
-  const query = params.get("q") ?? "";
+  const query = (params.get("q") ?? "").slice(0, 60);
 
   const [search, setSearch] = useState(query);
   const [data, setData] = useState<FilePage | null>(null);
@@ -48,6 +49,25 @@ export function FilesPage(): JSX.Element {
   useEffect(() => {
     setSearch(query);
   }, [query]);
+
+  // Una URL inválida se normaliza a valores por defecto con replace, sin romper la vista.
+  useEffect(() => {
+    const expected = new URLSearchParams(params);
+    const fix = (key: string, valid: boolean, value: string): void => {
+      const raw = params.get(key);
+      if (raw === null) return;
+      if (!valid || raw !== value) {
+        if (valid && value) expected.set(key, value);
+        else expected.delete(key);
+      }
+    };
+    fix("page", /^d+$/.test(params.get("page") ?? "0"), String(page));
+    fix("size", isSize(Number(params.get("size"))), String(size));
+    fix("status", status !== "" || params.get("status") === null, status);
+    fix("sort", (SORTS as readonly string[]).includes(params.get("sort") ?? SORTS[0]), sort);
+    fix("q", true, query);
+    if (expected.toString() !== params.toString()) setParams(expected, { replace: true });
+  }, [params, page, size, status, sort, query, setParams]);
 
   useEffect(() => {
     const trimmed = search.trim();
@@ -63,7 +83,7 @@ export function FilesPage(): JSX.Element {
         },
         { replace: true },
       );
-    }, 400);
+    }, 300);
     return () => window.clearTimeout(timer);
   }, [search, query, setParams]);
 
@@ -81,7 +101,8 @@ export function FilesPage(): JSX.Element {
     if (status) searchParams.set("status", status);
     if (query) searchParams.set("q", query);
 
-    apiRequest<FilePage>(`/files?${searchParams.toString()}`, { signal: controller.signal })
+    apiRequest<unknown>(`/files?${searchParams.toString()}`, { signal: controller.signal })
+      .then((raw) => FilePageSchema.parse(raw) as FilePage)
       .then((result) => {
         if (requestSeq.current !== seq) return;
         setData(result);

@@ -1,69 +1,78 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { apiRequest, isAbortError, isApiError, messageFor } from "../lib/api";
-import { useAuth } from "../lib/auth";
-import { BINS, BIN_NAME, percent, readInt } from "../lib/format";
-import { collectGroup, clampCell, TileStore, type GroupResult } from "../lib/grid";
-import { useFloor } from "../lib/floor";
-import { useRealtimeEvent } from "../lib/realtime";
-import type {
-  Bin,
-  CellRef,
-  DataFile,
-  RefineResult,
-  RefinementCreatedEvent,
-  Rules,
-} from "../lib/types";
 import { ErrorNotice, Loading } from "../components/Loading";
 import { VirtualGrid } from "../components/VirtualGrid";
+import { apiRequest, apiRequestWithMeta, isAbortError, isApiError, messageFor } from "../lib/api";
+import { useAuth } from "../lib/auth";
+import { useFloor } from "../lib/floor";
+import { BINS, BIN_NAME, percent, readInt } from "../lib/format";
+import { UnknownStrategyError, type GroupResult } from "../lib/group";
+import { TileStore, clampCell, collectGroup } from "../lib/grid";
+import { useRealtimeEvent } from "../lib/realtime";
+import { DataFileSchema, RefineResultSchema, RulesSchema } from "../lib/schemas";
+import type { Bin, CellRef, DataFile, RefineResult, RefinementCreatedEvent, Rules } from "../lib/types";
+
+const KNOWN_STRATEGIES = ["DIGIT_SUM_MOD", "MAX_DIGIT_MOD"];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function reasonFrom(error: unknown): string | null {
-  if (!isApiError(error)) return null;
-  const details = error.details;
-  if (typeof details === "object" && details !== null && "reason" in details) {
-    const reason = (details as { reason?: unknown }).reason;
-    if (typeof reason === "string") return reason;
-  }
-  return null;
+function jitter(ms: number): number {
+  return Math.round(ms * (0.75 + Math.random() * 0.5));
 }
 
-async function refineWithRetry(
-  fileId: number,
-  bin: Bin,
-  cells: CellRef[],
-  idempotencyKey: string,
-): Promise<RefineResult> {
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
+function detail<T>(error: unknown, field: string): T | null {
+  if (!isApiError(error)) return null;
+  const details = error.details;
+  if (typeof details !== "object" || details === null || !(field in details)) return null;
+  return (details as Record<string, T>)[field] ?? null;
+}
+
+const GROUP_INVALID_TEXT: Record<string, string> = {
+  BELOW_THRESHOLD: "El grupo incluye celdas que no dan miedo.",
+  NOT_CONNECTED: "Las celdas elegidas no forman un grupo conectado.",
+  SIZE_OUT_OF_RANGE: "El grupo es ruido por su tamaño: no se puede refinar.",
+};
+
+interface Intent {
+  key: string;
+  bin: Bin;
+  cells: CellRef[];
+}
+
+/**
+ * Envía UNA intención. Los reintentos por red, 503 o 429 reusan la misma Idempotency-Key y el mismo cuerpo.
+ * Una intención nueva (otra caja, otro clic) genera otra key en `refine`.
+ */
+async function submitIntent(fileId: number, intent: Intent): Promise<{ result: RefineResult; replayed: boolean }> {
+  for (let attempt = 0; ; attempt += 1) {
     try {
-      return await apiRequest<RefineResult>(`/files/${fileId}/refinements`, {
+      const response = await apiRequestWithMeta<unknown>(`/files/${fileId}/refinements`, {
         method: "POST",
-        headers: { "Idempotency-Key": idempotencyKey },
-        body: { bin, cells },
+        headers: { "Idempotency-Key": intent.key },
+        body: { bin: intent.bin, cells: intent.cells },
         retries: 0,
       });
+      // Idempotent-Replayed: true también es un éxito.
+      return { result: RefineResultSchema.parse(response.data), replayed: response.replayed };
     } catch (error) {
-      lastError = error;
-      if (isApiError(error) && (error.status === 503 || error.status === 0) && attempt < 3) {
-        await sleep(error.retryAfter ?? Math.min(8000, 500 * 2 ** attempt));
-        continue;
-      }
-      throw error;
+      const retriable = isApiError(error) && (error.status === 503 || error.status === 429 || error.status === 0);
+      if (!retriable || attempt >= 5) throw error;
+      await sleep(error.retryAfter ?? jitter(Math.min(8000, 500 * 2 ** attempt)));
     }
   }
-  throw lastError ?? new Error("No se pudo refinar.");
 }
 
 export function RefinePage(): JSX.Element {
   const { id } = useParams();
   const fileId = Number(id);
-  const [params] = useSearchParams();
+  const [params, setParams] = useSearchParams();
+  const setParamsRef = useRef(setParams);
+  setParamsRef.current = setParams;
   const { user, hasPermission } = useAuth();
   const canRefine = hasPermission("files:refine");
+  const cleared = user?.clearance.granted === true;
 
   const [file, setFile] = useState<DataFile | null>(null);
   const [rules, setRules] = useState<Rules | null>(null);
@@ -72,11 +81,8 @@ export function RefinePage(): JSX.Element {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
-  const urlR = readInt(params.get("r"), 0);
-  const urlC = readInt(params.get("c"), 0);
-  const [focus, setFocus] = useState<CellRef>({ r: urlR, c: urlC });
-  const [initialCell, setInitialCell] = useState<CellRef>({ r: urlR, c: urlC });
-  const initialised = useRef(false);
+  const [focus, setFocus] = useState<CellRef>({ r: 0, c: 0 });
+  const [initialCell, setInitialCell] = useState<CellRef>({ r: 0, c: 0 });
 
   const [selection, setSelection] = useState<GroupResult | null>(null);
   const [selectionAnchor, setSelectionAnchor] = useState<CellRef | null>(null);
@@ -86,16 +92,20 @@ export function RefinePage(): JSX.Element {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
-  const [drag, setDrag] = useState<{ x: number; y: number } | null>(null);
+  const [drag, setDrag] = useState<{ x: number; y: number; over: Bin | null } | null>(null);
+  const suppressClick = useRef(false);
+  const binRefs = useRef<Record<Bin, HTMLDivElement | null>>({ WO: null, FC: null, DR: null, MA: null });
 
   const selectionRequest = useRef(0);
+  const selectionAbort = useRef<AbortController | null>(null);
   const claimRequest = useRef<string | null>(null);
   const [claimPending, setClaimPending] = useState(false);
   const [claimInfo, setClaimInfo] = useState<{ requestId: string; claimId: string; cells: CellRef[] } | null>(null);
 
   const floor = useFloor({
     fileId: Number.isFinite(fileId) ? fileId : 0,
-    enabled: Number.isFinite(fileId) && fileId > 0,
+    // El piso compartido solo se abre cuando /auth/me indica clearance.granted.
+    enabled: Number.isFinite(fileId) && fileId > 0 && cleared,
     onClaimGranted: (requestId, claimId, cells) => {
       if (claimRequest.current !== requestId) return;
       setClaimInfo({ requestId, claimId, cells });
@@ -114,8 +124,9 @@ export function RefinePage(): JSX.Element {
     },
   });
 
+  // Carga del archivo y de sus reglas (nada hardcodeado), validadas con zod.
   useEffect(() => {
-    if (!Number.isFinite(fileId) || fileId <= 0) {
+    if (!Number.isInteger(fileId) || fileId <= 0) {
       setLoadError("El identificador del archivo no es válido.");
       setLoading(false);
       return;
@@ -132,20 +143,33 @@ export function RefinePage(): JSX.Element {
     setActionMessage(null);
 
     Promise.all([
-      apiRequest<DataFile>(`/files/${fileId}`, { signal: controller.signal }),
-      apiRequest<Rules>(`/files/${fileId}/rules`, { signal: controller.signal }),
+      apiRequest<unknown>(`/files/${fileId}`, { signal: controller.signal }),
+      apiRequest<unknown>(`/files/${fileId}/rules`, { signal: controller.signal }),
     ])
-      .then(([nextFile, nextRules]) => {
+      .then(([rawFile, rawRules]) => {
+        const nextFile = DataFileSchema.parse(rawFile);
+        const nextRules = RulesSchema.parse(rawRules);
         created = new TileStore(nextFile.id, nextFile.rows, nextFile.cols, nextFile.tileSize);
         setStore(created);
         setFile(nextFile);
         setRules(nextRules);
-        const clamped = clampCell(urlR, urlC, nextFile.rows, nextFile.cols);
-        if (!initialised.current) {
-          initialised.current = true;
-          setInitialCell(clamped);
-        }
+        // ?r=&c= inválidos se ajustan al rango y se corrigen en la URL con replace.
+        const rawR = readInt(params.get("r"), 0);
+        const rawC = readInt(params.get("c"), 0);
+        const clamped = clampCell(rawR, rawC, nextFile.rows, nextFile.cols);
+        setInitialCell(clamped);
         setFocus(clamped);
+        if (params.get("r") !== String(clamped.r) || params.get("c") !== String(clamped.c)) {
+          setParamsRef.current(
+            (current) => {
+              const next = new URLSearchParams(current);
+              next.set("r", String(clamped.r));
+              next.set("c", String(clamped.c));
+              return next;
+            },
+            { replace: true },
+          );
+        }
       })
       .catch((error: unknown) => {
         if (isAbortError(error)) return;
@@ -159,12 +183,19 @@ export function RefinePage(): JSX.Element {
       controller.abort();
       created?.dispose();
     };
+    // La posición inicial de la URL se lee solo al abrir el archivo.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileId, reloadKey]);
+
+  const strategyError =
+    rules && !KNOWN_STRATEGIES.includes(rules.binning.strategy)
+      ? `Este archivo usa una estrategia de cajas desconocida ("${rules.binning.strategy}"). No se puede calcular la caja correcta, así que no se ofrece ninguna.`
+      : null;
 
   const clearSelection = useCallback(
     (release: boolean) => {
       selectionRequest.current += 1;
+      selectionAbort.current?.abort();
       if (release && claimInfo) floor.release(claimInfo.claimId);
       claimRequest.current = null;
       setClaimInfo(null);
@@ -178,15 +209,19 @@ export function RefinePage(): JSX.Element {
 
   const selectCell = useCallback(
     async (cell: CellRef) => {
+      if (suppressClick.current) return;
       if (!store || !rules || !file) return;
       const current = store.getCell(cell.r, cell.c);
-      if (!current || current.tremor < rules.tremorThreshold) {
+      if (current && (current.tremor < rules.tremorThreshold || current.bin !== ".")) {
         clearSelection(true);
         setActionMessage(null);
         return;
       }
       const request = selectionRequest.current + 1;
       selectionRequest.current = request;
+      selectionAbort.current?.abort();
+      const controller = new AbortController();
+      selectionAbort.current = controller;
       if (claimInfo) floor.release(claimInfo.claimId);
       setClaimInfo(null);
       claimRequest.current = null;
@@ -197,18 +232,23 @@ export function RefinePage(): JSX.Element {
       setActionMessage(null);
       setSelectionAnchor(cell);
       try {
-        const group = await collectGroup(store, rules, file.rows, file.cols, cell);
+        const group = await collectGroup(store, rules, cell, controller.signal);
         if (selectionRequest.current !== request) return;
+        if (group.size === 0) {
+          setSelection(null);
+          setSelectionAnchor(null);
+          return;
+        }
         setSelection(group);
         if (!group.noise && canRefine && floor.status === "open") {
           setClaimPending(true);
           claimRequest.current = floor.claim(cell.r, cell.c);
         }
       } catch (error) {
-        if (selectionRequest.current !== request) return;
+        if (selectionRequest.current !== request || isAbortError(error)) return;
         setSelection(null);
         setSelectionAnchor(null);
-        setSelectError(messageFor(error));
+        setSelectError(error instanceof UnknownStrategyError ? error.message : messageFor(error));
       } finally {
         if (selectionRequest.current === request) setSelecting(false);
       }
@@ -230,11 +270,13 @@ export function RefinePage(): JSX.Element {
     if (!selectionAnchor) return;
     setClaimPending(true);
     claimRequest.current = floor.claim(selectionAnchor.r, selectionAnchor.c);
+    // Solo al (re)conectar el piso.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [floor.status]);
 
   useEffect(() => {
     return () => {
+      selectionAbort.current?.abort();
       if (claimInfo) floor.release(claimInfo.claimId);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -269,7 +311,9 @@ export function RefinePage(): JSX.Element {
 
   const refine = useCallback(
     async (bin: Bin) => {
-      if (!selection || selection.noise || !file || !store || busyRef.current) return;
+      // Bloqueo con ref: un doble clic o un doble Enter no envían nada.
+      if (busyRef.current) return;
+      if (!selection || selection.noise || !file || !store || strategyError) return;
       if (!canRefine) {
         setActionError("Tu rol no tiene permiso para refinar.");
         return;
@@ -282,11 +326,15 @@ export function RefinePage(): JSX.Element {
       setBusy(true);
       setActionError(null);
       setActionMessage(null);
-      const key = crypto.randomUUID();
-      const cells = selection.cells;
+      // Una key por intención del usuario (esta pulsación), creada una sola vez.
+      const intent: Intent = {
+        key: crypto.randomUUID(),
+        bin,
+        cells: selection.cells.map(({ r, c }) => ({ r, c })),
+      };
       try {
-        const result = await refineWithRetry(file.id, bin, cells, key);
-        store.setBin(cells, bin);
+        const { result, replayed } = await submitIntent(file.id, intent);
+        store.setBin(intent.cells, result.bin);
         setFile((previous) =>
           previous
             ? {
@@ -299,20 +347,38 @@ export function RefinePage(): JSX.Element {
               }
             : previous,
         );
-        setActionMessage(`Grupo de ${result.size} celdas llevado a ${BIN_NAME[bin]}.`);
+        setActionMessage(
+          `Grupo de ${result.size} celdas llevado a ${BIN_NAME[result.bin]}${replayed ? " (ya estaba registrado)" : ""}.`,
+        );
         clearSelection(true);
       } catch (error) {
-        if (isApiError(error) && error.status === 409) {
-          await store.refreshTilesFor(cells);
-          setActionError("Alguna celda ya estaba refinada. Actualizamos los bloques afectados; vuelve a seleccionar el grupo.");
-          clearSelection(false);
-        } else if (isApiError(error) && error.status === 422) {
-          const reason = reasonFrom(error) ?? error.message;
+        if (isApiError(error) && error.status === 409 && error.code === "GROUP_CLAIMED") {
+          const holder = detail<{ displayName?: string }>(error, "holder");
           setActionError(
-            error.code === "WRONG_BIN"
-              ? `Esa no es la caja correcta: ${reason}. El grupo sigue seleccionado.`
-              : `No se pudo refinar: ${reason}.`,
+            `Otro refinador${holder?.displayName ? ` (${holder.displayName})` : ""} tiene reservado este grupo. Espera a que lo libere.`,
           );
+        } else if (isApiError(error) && error.status === 409) {
+          // ALREADY_REFINED: vuelve a pedir los bloques afectados y limpia la selección.
+          const tiles = detail<Array<[number, number]>>(error, "tiles");
+          if (tiles && tiles.length > 0) await store.refreshTiles(tiles);
+          else await store.refreshTilesFor(intent.cells);
+          clearSelection(false);
+          setActionError("Alguna celda ya estaba refinada. Actualizamos los bloques afectados; elige el grupo de nuevo.");
+        } else if (isApiError(error) && error.status === 422 && error.code === "WRONG_BIN") {
+          const mistakes = detail<number>(error, "mistakes");
+          if (mistakes !== null) setFile((previous) => (previous ? { ...previous, mistakes } : previous));
+          setActionError(
+            `Esa no es la caja correcta (${BIN_NAME[bin]}). Lumon anotó el error${mistakes !== null ? `: ${mistakes} en este archivo` : ""}. Revisa la caja sugerida y prueba otra.`,
+          );
+        } else if (isApiError(error) && error.status === 422 && error.code === "GROUP_INVALID") {
+          const reason = detail<string>(error, "reason");
+          const missing = detail<number>(error, "missing");
+          setActionError(
+            reason === "INCOMPLETE"
+              ? `Al grupo le faltan ${missing ?? "algunas"} celdas conectadas. Vuelve a seleccionarlo.`
+              : (reason && GROUP_INVALID_TEXT[reason]) || "El servidor no aceptó este grupo.",
+          );
+          if (reason === "INCOMPLETE" || reason === "BELOW_THRESHOLD") clearSelection(false);
         } else {
           setActionError(messageFor(error));
         }
@@ -321,8 +387,29 @@ export function RefinePage(): JSX.Element {
         setBusy(false);
       }
     },
-    [selection, file, store, canRefine, selectedClaim, clearSelection],
+    [selection, file, store, canRefine, selectedClaim, clearSelection, strategyError],
   );
+
+  // Teclas 1 a 4 llevan el grupo seleccionado a cada caja; Escape cancela la selección.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent): void => {
+      const target = event.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT")) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.key === "Escape" && selection && !drag) {
+        clearSelection(true);
+        return;
+      }
+      const index = ["1", "2", "3", "4"].indexOf(event.key);
+      const bin = index >= 0 ? BINS[index] : undefined;
+      if (bin && selection && !selection.noise) {
+        event.preventDefault();
+        void refine(bin);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selection, drag, refine, clearSelection]);
 
   useRealtimeEvent("refinement.created", (event) => {
     const data = event.data as RefinementCreatedEvent | null;
@@ -331,9 +418,7 @@ export function RefinePage(): JSX.Element {
     setFile((previous) => (previous ? { ...previous, progress: data.progress } : previous));
     setSelection((current) => {
       if (!current) return current;
-      const affected = current.cells.some((cell) =>
-        data.cells.some((other) => other.r === cell.r && other.c === cell.c),
-      );
+      const affected = current.cells.some((cell) => data.cells.some((other) => other.r === cell.r && other.c === cell.c));
       return affected ? null : current;
     });
   });
@@ -346,11 +431,23 @@ export function RefinePage(): JSX.Element {
 
   useRealtimeEvent("stream.reset", () => setReloadKey((value) => value + 1));
 
+  // ?r=&c= se actualiza con replace y debounce: no llena el historial.
+  const positionTimer = useRef(0);
+  useEffect(() => () => window.clearTimeout(positionTimer.current), []);
   const onPositionChange = useCallback((cell: CellRef) => {
-    const url = new URL(window.location.href);
-    url.searchParams.set("r", String(cell.r));
-    url.searchParams.set("c", String(cell.c));
-    window.history.replaceState(null, "", url);
+    window.clearTimeout(positionTimer.current);
+    positionTimer.current = window.setTimeout(() => {
+      setParamsRef.current(
+        (current) => {
+          if (current.get("r") === String(cell.r) && current.get("c") === String(cell.c)) return current;
+          const next = new URLSearchParams(current);
+          next.set("r", String(cell.r));
+          next.set("c", String(cell.c));
+          return next;
+        },
+        { replace: true },
+      );
+    }, 250);
   }, []);
 
   const onFocusChange = useCallback(
@@ -361,27 +458,66 @@ export function RefinePage(): JSX.Element {
     [floor],
   );
 
+  // Arrastre con Pointer Events: captura, fantasma, hit test con getBoundingClientRect y Escape para cancelar.
   const onDragStart = useCallback(
     (_cell: CellRef, event: React.PointerEvent<HTMLDivElement>) => {
-      if (!selection || selection.noise || !canRefine) return;
+      if (!selection || selection.noise || !canRefine || busyRef.current || strategyError) return;
       event.preventDefault();
-      setDrag({ x: event.clientX, y: event.clientY });
-      const move = (moveEvent: PointerEvent) => setDrag({ x: moveEvent.clientX, y: moveEvent.clientY });
-      const up = (upEvent: PointerEvent) => {
+      const target = event.currentTarget;
+      const pointerId = event.pointerId;
+      try {
+        target.setPointerCapture(pointerId);
+      } catch {
+        /* el puntero ya no está activo */
+      }
+      const hit = (x: number, y: number): Bin | null => {
+        for (const bin of BINS) {
+          const element = binRefs.current[bin];
+          if (!element) continue;
+          const rect = element.getBoundingClientRect();
+          if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return bin;
+        }
+        return null;
+      };
+      const finish = (): void => {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
+        window.removeEventListener("pointercancel", cancel);
+        window.removeEventListener("keydown", key, true);
+        try {
+          target.releasePointerCapture(pointerId);
+        } catch {
+          /* ya liberado */
+        }
         setDrag(null);
-        const element = document.elementFromPoint(upEvent.clientX, upEvent.clientY);
-        const binElement = element?.closest<HTMLElement>("[data-bin]");
-        const bin = binElement?.dataset.bin;
-        if (bin === "WO" || bin === "FC" || bin === "DR" || bin === "MA") {
-          void refine(bin);
+        window.setTimeout(() => {
+          suppressClick.current = false;
+        }, 0);
+      };
+      const move = (moveEvent: PointerEvent): void => {
+        setDrag({ x: moveEvent.clientX, y: moveEvent.clientY, over: hit(moveEvent.clientX, moveEvent.clientY) });
+      };
+      const up = (upEvent: PointerEvent): void => {
+        const bin = hit(upEvent.clientX, upEvent.clientY);
+        finish();
+        if (bin) void refine(bin);
+      };
+      const cancel = (): void => finish();
+      const key = (keyEvent: KeyboardEvent): void => {
+        if (keyEvent.key === "Escape") {
+          keyEvent.preventDefault();
+          keyEvent.stopPropagation();
+          finish();
         }
       };
+      suppressClick.current = true;
+      setDrag({ x: event.clientX, y: event.clientY, over: null });
       window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", up, { once: true });
+      window.addEventListener("pointerup", up);
+      window.addEventListener("pointercancel", cancel);
+      window.addEventListener("keydown", key, true);
     },
-    [selection, canRefine, refine],
+    [selection, canRefine, refine, strategyError],
   );
 
   if (loading && !file) return <Loading label="Abriendo archivo…" />;
@@ -403,7 +539,8 @@ export function RefinePage(): JSX.Element {
         <p className="font-mono text-xs tracking-[0.3em] text-lumon-mintDim">ARCHIVO COMPLETADO</p>
         <h1 className="mt-2 text-2xl font-semibold text-lumon-mint">{file.name}</h1>
         <p className="mt-2 text-sm text-lumon-mint/70">
-          Todos los grupos encontraron su caja. El trabajo es misterioso e importante.
+          Todos los grupos encontraron su caja. {file.mistakes} {file.mistakes === 1 ? "error" : "errores"} de refinamiento. El trabajo es
+          misterioso e importante.
         </p>
         <Link to="/files" className="mt-6 inline-block rounded bg-lumon-mint px-4 py-2 text-sm font-semibold text-lumon-ink">
           Volver a archivos
@@ -419,7 +556,9 @@ export function RefinePage(): JSX.Element {
         ? "Conectando al piso"
         : floor.status === "fatal"
           ? "Piso no disponible"
-          : "Piso sin conexión";
+          : cleared
+            ? "Piso sin conexión"
+            : "Piso cerrado (sin clearance)";
 
   return (
     <section className="space-y-4">
@@ -430,8 +569,12 @@ export function RefinePage(): JSX.Element {
           </Link>
           <h1 className="mt-1 text-xl font-semibold text-lumon-mint">{file.name}</h1>
           <p className="font-mono text-xs text-lumon-mint/50">
-            {file.rows} × {file.cols} · bloques de {file.tileSize} · {file.refinedGroups}/{file.totalGroups} grupos ·{" "}
-            {file.mistakes} errores
+            {file.rows} × {file.cols} · bloques de {file.tileSize} · {file.refinedGroups}/{file.totalGroups} grupos · {file.mistakes}{" "}
+            errores
+          </p>
+          <p className="font-mono text-[11px] text-lumon-mint/40">
+            Reglas: temblor ≥ {rules.tremorThreshold} · conectividad {rules.connectivity} · grupo de {rules.minGroupSize} a{" "}
+            {rules.maxGroupSize} celdas · {rules.binning.strategy}
           </p>
         </div>
         <div className="text-right text-xs text-lumon-mint/60">
@@ -448,32 +591,47 @@ export function RefinePage(): JSX.Element {
         </div>
       </div>
 
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        {BINS.map((bin) => (
+      {strategyError ? <ErrorNotice message={strategyError} /> : null}
+
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4" role="group" aria-label="Cajas">
+        {BINS.map((bin, index) => (
           <div
             key={bin}
+            ref={(element) => {
+              binRefs.current[bin] = element;
+            }}
             data-bin={bin}
             className={`rounded border p-3 ${
-              selection?.bin === bin && !selection.noise
-                ? "border-lumon-mint bg-lumon-mint/10"
-                : "border-lumon-line bg-lumon-panel"
+              drag?.over === bin
+                ? "border-lumon-amber bg-lumon-amber/15"
+                : selection?.bin === bin && !selection.noise
+                  ? "border-lumon-mint bg-lumon-mint/10"
+                  : "border-lumon-line bg-lumon-panel"
             }`}
           >
             <div className="flex items-center justify-between text-xs">
               <span className="font-semibold text-lumon-mint">{BIN_NAME[bin]}</span>
-              <span className="font-mono text-lumon-mint/50">{bin}</span>
+              <span className="font-mono text-lumon-mint/50">
+                {bin} · tecla {index + 1}
+              </span>
             </div>
-            <div className="mt-2 h-1.5 overflow-hidden rounded bg-lumon-line">
+            <div
+              className="mt-2 h-1.5 overflow-hidden rounded bg-lumon-line"
+              role="progressbar"
+              aria-label={`Progreso de ${BIN_NAME[bin]}`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(file.progress[bin] * 100)}
+            >
               <div className="h-full bg-lumon-mint" style={{ width: percent(file.progress[bin]) }} />
             </div>
             <p className="mt-1 font-mono text-[11px] text-lumon-mint/50">{percent(file.progress[bin])}</p>
             <button
               type="button"
-              data-bin={bin}
               onClick={() => void refine(bin)}
-              disabled={!selection || selection.noise || busy || !canRefine || Boolean(selectedClaim) || claimPending}
+              disabled={!selection || selection.noise || busy || !canRefine || Boolean(selectedClaim) || claimPending || Boolean(strategyError)}
               className="mt-2 w-full rounded border border-lumon-mint/30 px-2 py-1 text-xs text-lumon-mint disabled:opacity-40"
-              aria-keyshortcuts={`${BINS.indexOf(bin) + 1}`}
+              aria-keyshortcuts={String(index + 1)}
             >
               {busy ? "Enviando…" : `Llevar a ${BIN_NAME[bin]}`}
             </button>
@@ -497,31 +655,29 @@ export function RefinePage(): JSX.Element {
             ) : selection ? (
               selection.noise ? (
                 <span className="text-lumon-amber">
-                  {selection.reason ?? "Es ruido: no se puede refinar."} ({selection.size} celdas)
+                  Ruido · {selection.size}
+                  {selection.truncated ? "+" : ""} celdas. {selection.reason}
                 </span>
               ) : (
                 <span className="text-lumon-mint">
-                  Grupo de {selection.size} celdas · caja correcta:{" "}
-                  <strong>{selection.bin ? BIN_NAME[selection.bin] : "—"}</strong>
+                  Grupo de {selection.size} celdas · caja correcta: <strong>{selection.bin ? BIN_NAME[selection.bin] : "—"}</strong>
                   {claimPending ? " · reservando…" : ""}
                   {selectedClaim ? ` · reservado por ${selectedClaim.displayName}` : ""}
                 </span>
               )
             ) : (
-              <span className="text-lumon-mint/60">Elige una celda que tiemble para seleccionar su grupo.</span>
+              <span className="text-lumon-mint/60">Elige una celda que tiemble para seleccionar su grupo completo.</span>
             )}
           </div>
-          <div className="flex items-center gap-2">
-            {selection ? (
-              <button
-                type="button"
-                onClick={() => clearSelection(true)}
-                className="rounded border border-lumon-line px-3 py-1 text-xs text-lumon-mint/80"
-              >
-                Cancelar selección
-              </button>
-            ) : null}
-          </div>
+          {selection ? (
+            <button
+              type="button"
+              onClick={() => clearSelection(true)}
+              className="rounded border border-lumon-line px-3 py-1 text-xs text-lumon-mint/80"
+            >
+              Cancelar selección (Esc)
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -572,8 +728,8 @@ export function RefinePage(): JSX.Element {
         </div>
         <div className="rounded border border-lumon-line bg-lumon-panel p-3 text-xs text-lumon-mint/60">
           <h2 className="text-sm font-semibold text-lumon-mint">Controles</h2>
-          <p className="mt-2">Flechas mueven el foco. PageUp/PageDown saltan páginas. Home/End van al borde.</p>
-          <p className="mt-1">Enter selecciona el grupo. Tab llega a las cajas; Enter las envía.</p>
+          <p className="mt-2">Flechas mueven el foco; PageUp/PageDown saltan una página; Home/End van al borde de la fila; Ctrl+Home/End al inicio y al final.</p>
+          <p className="mt-1">Enter o clic selecciona el grupo. Las teclas 1 a 4 lo llevan a Woe, Frolic, Dread o Malice. Esc cancela.</p>
           <p className="mt-1">También puedes arrastrar el grupo seleccionado hasta una caja.</p>
         </div>
       </div>
@@ -582,8 +738,9 @@ export function RefinePage(): JSX.Element {
         <div
           className="pointer-events-none fixed z-50 rounded-full bg-lumon-amber px-3 py-1 text-xs font-semibold text-lumon-ink"
           style={{ left: drag.x + 12, top: drag.y + 12 }}
+          aria-hidden="true"
         >
-          {selection?.size ?? 0} celdas
+          {selection?.size ?? 0} celdas{drag.over ? ` → ${BIN_NAME[drag.over]}` : ""}
         </div>
       ) : null}
     </section>

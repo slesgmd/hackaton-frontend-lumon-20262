@@ -1,11 +1,15 @@
 import { apiRequest, isAbortError, isApiError } from "./api";
 import { BIN_CHAR, clamp } from "./format";
-import type { Bin, BinChar, CellRef, Rules, Tile } from "./types";
+import type { CellData, GroupSource } from "./group";
+import { TileSchema } from "./schemas";
+import type { Bin, CellRef } from "./types";
 
-export interface GridCell {
+export type { GroupResult } from "./group";
+export { collectGroup } from "./group";
+
+export interface GridCell extends CellData {
   digit: number;
   tremor: number;
-  bin: BinChar;
 }
 
 interface DecodedTile {
@@ -15,30 +19,44 @@ interface DecodedTile {
   originCol: number;
   values: Uint8Array;
   tremor: Uint8Array;
-  bins: string;
+  /** Código de carácter de cada celda: "." W F D M. */
+  bins: Uint8Array;
   version: number;
 }
 
-const TREMOR_BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
-
-function decodeBase64(value: string): Uint8Array {
-  if (!value) return new Uint8Array(0);
-  if (!TREMOR_BASE64.test(value)) return new Uint8Array(0);
-  try {
-    const binary = window.atob(value);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  } catch {
-    return new Uint8Array(0);
-  }
+interface Job {
+  key: string;
+  tileRow: number;
+  tileCol: number;
+  controller: AbortController;
+  resolve: (tile: DecodedTile | null) => void;
 }
 
-function decodeTile(tile: Tile): DecodedTile {
-  const values = new Uint8Array(tile.values.length);
-  for (let i = 0; i < tile.values.length; i += 1) {
-    const code = tile.values.charCodeAt(i) - 48;
-    values[i] = code >= 0 && code <= 9 ? code : 0;
+const MAX_CONCURRENT = 4;
+const MAX_ATTEMPTS = 7;
+const DOT = ".".charCodeAt(0);
+
+function decodeBase64(value: string): Uint8Array {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function decodeTile(raw: unknown): DecodedTile {
+  const tile = TileSchema.parse(raw);
+  const count = tile.rows * tile.cols;
+  if (tile.values.length !== count || tile.bins.length !== count) {
+    throw new Error("El bloque llegó con un tamaño que no coincide con rows × cols.");
+  }
+  const tremor = decodeBase64(tile.tremor);
+  if (tremor.length !== count) throw new Error("El temblor del bloque no coincide con rows × cols.");
+  const values = new Uint8Array(count);
+  const bins = new Uint8Array(count);
+  for (let i = 0; i < count; i += 1) {
+    const digit = tile.values.charCodeAt(i) - 48;
+    values[i] = digit >= 0 && digit <= 9 ? digit : 0;
+    bins[i] = tile.bins.charCodeAt(i);
   }
   return {
     rows: tile.rows,
@@ -46,32 +64,63 @@ function decodeTile(tile: Tile): DecodedTile {
     originRow: tile.originRow,
     originCol: tile.originCol,
     values,
-    tremor: decodeBase64(tile.tremor),
-    bins: tile.bins,
+    tremor,
+    bins,
     version: tile.version,
   };
 }
 
-function tileKey(tileRow: number, tileCol: number): string {
+export function tileKey(tileRow: number, tileCol: number): string {
   return `${tileRow}:${tileCol}`;
 }
 
-export class TileStore {
+function jitter(ms: number): number {
+  return Math.round(ms * (0.75 + Math.random() * 0.5));
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export class TileStore implements GroupSource {
   readonly fileId: number;
+  readonly rows: number;
+  readonly cols: number;
   readonly tileSize: number;
   readonly tileRows: number;
   readonly tileCols: number;
 
   private decoded = new Map<string, DecodedTile>();
-  private inflight = new Map<string, Promise<DecodedTile | null>>();
-  private controllers = new Map<string, AbortController>();
+  /** Un solo request por bloque: nunca hay dos en vuelo (ni en cola) para la misma clave. */
+  private inflight = new Map<string, { promise: Promise<DecodedTile | null>; controller: AbortController }>();
+  private queue: Job[] = [];
+  private active = 0;
+  private pauseUntil = 0;
+  private pinned = new Map<string, number>();
   private listeners = new Set<() => void>();
-  private pinned = new Set<string>();
-  private gateUntil = 0;
+  private notifyScheduled = false;
   private disposed = false;
+  /** Para pruebas y para el indicador: peticiones de red realmente iniciadas. */
+  requestsStarted = 0;
 
   constructor(fileId: number, rows: number, cols: number, tileSize: number) {
     this.fileId = fileId;
+    this.rows = rows;
+    this.cols = cols;
     this.tileSize = Math.max(1, tileSize);
     this.tileRows = Math.max(1, Math.ceil(rows / this.tileSize));
     this.tileCols = Math.max(1, Math.ceil(cols / this.tileSize));
@@ -82,8 +131,14 @@ export class TileStore {
     return () => this.listeners.delete(listener);
   }
 
+  /** Agrupa las notificaciones en un frame para no renderizar la grilla por cada bloque. */
   private notify(): void {
-    this.listeners.forEach((listener) => listener());
+    if (this.notifyScheduled || this.disposed) return;
+    this.notifyScheduled = true;
+    window.requestAnimationFrame(() => {
+      this.notifyScheduled = false;
+      if (!this.disposed) this.listeners.forEach((listener) => listener());
+    });
   }
 
   hasTile(tileRow: number, tileCol: number): boolean {
@@ -91,156 +146,164 @@ export class TileStore {
   }
 
   getCell(r: number, c: number): GridCell | null {
-    const tr = Math.floor(r / this.tileSize);
-    const tc = Math.floor(c / this.tileSize);
-    const tile = this.decoded.get(tileKey(tr, tc));
+    const tile = this.decoded.get(tileKey(Math.floor(r / this.tileSize), Math.floor(c / this.tileSize)));
     if (!tile) return null;
     const localR = r - tile.originRow;
     const localC = c - tile.originCol;
     if (localR < 0 || localC < 0 || localR >= tile.rows || localC >= tile.cols) return null;
     const index = localR * tile.cols + localC;
-    const bin = tile.bins.charAt(index);
+    const code = tile.bins[index] ?? DOT;
     return {
       digit: tile.values[index] ?? 0,
       tremor: tile.tremor[index] ?? 0,
-      bin: bin === "W" || bin === "F" || bin === "D" || bin === "M" ? bin : ".",
+      bin: String.fromCharCode(code),
     };
   }
 
-  setWanted(keys: Set<string>): void {
-    for (const [key, controller] of this.controllers) {
-      if (!keys.has(key) && !this.pinned.has(key)) {
-        controller.abort();
-        this.controllers.delete(key);
-      }
+  /** Cancela lo que salió de la vista, salvo los bloques fijados por una selección en curso. */
+  setWanted(wanted: Set<string>): void {
+    for (const [key, entry] of this.inflight) {
+      if (!wanted.has(key) && !this.pinned.has(key)) entry.controller.abort();
     }
   }
 
   pin(keys: Iterable<string>): () => void {
     const added: string[] = [];
     for (const key of keys) {
-      if (!this.pinned.has(key)) {
-        this.pinned.add(key);
-        added.push(key);
-      }
+      this.pinned.set(key, (this.pinned.get(key) ?? 0) + 1);
+      added.push(key);
     }
     return () => {
-      for (const key of added) this.pinned.delete(key);
+      for (const key of added) {
+        const count = (this.pinned.get(key) ?? 1) - 1;
+        if (count <= 0) this.pinned.delete(key);
+        else this.pinned.set(key, count);
+      }
     };
   }
 
-  private async waitGate(signal: AbortSignal): Promise<void> {
-    const wait = this.gateUntil - Date.now();
-    if (wait <= 0) return;
-    await new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        signal.removeEventListener("abort", onAbort);
-        resolve();
-      }, wait);
-      const onAbort = () => {
-        window.clearTimeout(timer);
-        reject(new DOMException("Aborted", "AbortError"));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-    });
-  }
-
-  async load(tileRow: number, tileCol: number, force = false): Promise<DecodedTile | null> {
-    const key = tileKey(tileRow, tileCol);
-    if (!force && this.decoded.has(key)) return this.decoded.get(key) ?? null;
-    if (!force) {
-      const pending = this.inflight.get(key);
-      if (pending) return pending;
+  load(tileRow: number, tileCol: number, force = false): Promise<DecodedTile | null> {
+    if (this.disposed) return Promise.resolve(null);
+    if (tileRow < 0 || tileCol < 0 || tileRow >= this.tileRows || tileCol >= this.tileCols) {
+      return Promise.resolve(null);
     }
-    if (tileRow < 0 || tileCol < 0 || tileRow >= this.tileRows || tileCol >= this.tileCols) return null;
+    const key = tileKey(tileRow, tileCol);
+    if (!force) {
+      const cached = this.decoded.get(key);
+      if (cached) return Promise.resolve(cached);
+    }
+    const existing = this.inflight.get(key);
+    if (existing && !existing.controller.signal.aborted) return existing.promise;
 
     const controller = new AbortController();
-    this.controllers.set(key, controller);
+    const promise = new Promise<DecodedTile | null>((resolve) => {
+      this.queue.push({ key, tileRow, tileCol, controller, resolve });
+    });
+    const entry = { promise, controller };
+    this.inflight.set(key, entry);
+    void promise.then(() => {
+      if (this.inflight.get(key) === entry) this.inflight.delete(key);
+    });
+    this.pump();
+    return promise;
+  }
 
-    const promise = (async (): Promise<DecodedTile | null> => {
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        if (this.disposed) return null;
+  private pump(): void {
+    while (!this.disposed && this.active < MAX_CONCURRENT && this.queue.length > 0) {
+      const job = this.queue.shift();
+      if (!job) break;
+      if (job.controller.signal.aborted) {
+        job.resolve(null);
+        continue;
+      }
+      this.active += 1;
+      void this.run(job).finally(() => {
+        this.active -= 1;
+        this.pump();
+      });
+    }
+  }
+
+  private async run(job: Job): Promise<void> {
+    const { controller } = job;
+    try {
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+        if (this.disposed || controller.signal.aborted) break;
+        // Un 429 pausa TODOS los pedidos hasta que pase Retry-After.
+        const pause = this.pauseUntil - Date.now();
+        if (pause > 0) await abortableSleep(pause, controller.signal);
         try {
-          await this.waitGate(controller.signal);
-          const tile = await apiRequest<Tile>(
-            `/files/${this.fileId}/tiles/${tileRow}/${tileCol}`,
-            { signal: controller.signal, retries: 0 },
-          );
-          const result = decodeTile(tile);
-          if (!this.disposed) {
-            this.decoded.set(key, result);
-            this.notify();
-          }
-          return result;
+          this.requestsStarted += 1;
+          const raw = await apiRequest<unknown>(`/files/${this.fileId}/tiles/${job.tileRow}/${job.tileCol}`, {
+            signal: controller.signal,
+            retries: 0,
+          });
+          const tile = decodeTile(raw);
+          const previous = this.decoded.get(job.key);
+          // Una respuesta vieja nunca pisa a una nueva.
+          if (!previous || tile.version >= previous.version) this.decoded.set(job.key, tile);
+          this.notify();
+          job.resolve(this.decoded.get(job.key) ?? tile);
+          return;
         } catch (error) {
-          if (this.disposed || isAbortError(error) || controller.signal.aborted) return null;
+          if (isAbortError(error) || controller.signal.aborted) break;
           if (isApiError(error) && error.status === 429) {
-            const wait = error.retryAfter ?? 1000;
-            this.gateUntil = Math.max(this.gateUntil, Date.now() + wait);
+            this.pauseUntil = Math.max(this.pauseUntil, Date.now() + (error.retryAfter ?? 1000));
             continue;
           }
           if (isApiError(error) && (error.status === 503 || error.status === 0)) {
-            const wait = error.retryAfter ?? Math.min(8000, 500 * 2 ** attempt);
-            await new Promise<void>((resolve) => window.setTimeout(resolve, wait));
+            const wait = error.retryAfter ?? jitter(Math.min(8000, 500 * 2 ** attempt));
+            await abortableSleep(wait, controller.signal);
             continue;
           }
-          if (isApiError(error) && error.status === 404) return null;
-          return null;
+          break;
         }
       }
-      return null;
-    })();
+    } catch {
+      /* cancelado mientras esperaba */
+    }
+    job.resolve(null);
+  }
 
-    this.inflight.set(key, promise);
+  /** Asegura un bloque y lo fija mientras dure la espera para que no se cancele. */
+  async ensureTile(tileRow: number, tileCol: number, signal?: AbortSignal): Promise<void> {
+    const unpin = this.pin([tileKey(tileRow, tileCol)]);
     try {
-      return await promise;
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      await this.load(tileRow, tileCol);
     } finally {
-      this.inflight.delete(key);
-      this.controllers.delete(key);
+      unpin();
     }
   }
 
-  async ensureCell(r: number, c: number): Promise<GridCell | null> {
-    const existing = this.getCell(r, c);
-    if (existing) return existing;
-    const tr = Math.floor(r / this.tileSize);
-    const tc = Math.floor(c / this.tileSize);
-    await this.load(tr, tc);
-    return this.getCell(r, c);
-  }
-
   setBin(cells: CellRef[], bin: Bin): void {
-    const char = BIN_CHAR[bin];
-    const changed = new Set<string>();
+    const code = BIN_CHAR[bin].charCodeAt(0);
+    let changed = false;
     for (const { r, c } of cells) {
-      const tr = Math.floor(r / this.tileSize);
-      const tc = Math.floor(c / this.tileSize);
-      const key = tileKey(tr, tc);
-      const tile = this.decoded.get(key);
+      const tile = this.decoded.get(tileKey(Math.floor(r / this.tileSize), Math.floor(c / this.tileSize)));
       if (!tile) continue;
       const localR = r - tile.originRow;
       const localC = c - tile.originCol;
       if (localR < 0 || localC < 0 || localR >= tile.rows || localC >= tile.cols) continue;
-      const index = localR * tile.cols + localC;
-      const bins = tile.bins.split("");
-      bins[index] = char;
-      tile.bins = bins.join("");
-      changed.add(key);
+      tile.bins[localR * tile.cols + localC] = code;
+      changed = true;
     }
-    if (changed.size > 0) this.notify();
+    if (changed) this.notify();
+  }
+
+  /** Vuelve a pedir bloques concretos (por ejemplo, tras un 409 ALREADY_REFINED). */
+  async refreshTiles(keys: Array<[number, number]>): Promise<void> {
+    await Promise.all(keys.map(([row, col]) => this.load(row, col, true)));
   }
 
   async refreshTilesFor(cells: CellRef[]): Promise<void> {
-    const keys = new Set<string>();
+    const unique = new Map<string, [number, number]>();
     for (const { r, c } of cells) {
-      keys.add(tileKey(Math.floor(r / this.tileSize), Math.floor(c / this.tileSize)));
+      const row = Math.floor(r / this.tileSize);
+      const col = Math.floor(c / this.tileSize);
+      unique.set(tileKey(row, col), [row, col]);
     }
-    await Promise.all(
-      [...keys].map((key) => {
-        const [row, col] = key.split(":");
-        return this.load(Number(row), Number(col), true);
-      }),
-    );
+    await this.refreshTiles([...unique.values()]);
   }
 
   tileKeyFor(r: number, c: number): string {
@@ -249,10 +312,10 @@ export class TileStore {
 
   visibleTileKeys(startRow: number, endRow: number, startCol: number, endCol: number): Set<string> {
     const keys = new Set<string>();
-    const firstRow = Math.floor(startRow / this.tileSize);
-    const lastRow = Math.floor(endRow / this.tileSize);
-    const firstCol = Math.floor(startCol / this.tileSize);
-    const lastCol = Math.floor(endCol / this.tileSize);
+    const firstRow = Math.max(0, Math.floor(startRow / this.tileSize));
+    const lastRow = Math.min(this.tileRows - 1, Math.floor(endRow / this.tileSize));
+    const firstCol = Math.max(0, Math.floor(startCol / this.tileSize));
+    const lastCol = Math.min(this.tileCols - 1, Math.floor(endCol / this.tileSize));
     for (let tr = firstRow; tr <= lastRow; tr += 1) {
       for (let tc = firstCol; tc <= lastCol; tc += 1) keys.add(tileKey(tr, tc));
     }
@@ -261,134 +324,12 @@ export class TileStore {
 
   dispose(): void {
     this.disposed = true;
-    this.controllers.forEach((controller) => controller.abort());
-    this.controllers.clear();
+    for (const entry of this.inflight.values()) entry.controller.abort();
+    for (const job of this.queue) job.resolve(null);
+    this.queue = [];
     this.inflight.clear();
     this.listeners.clear();
   }
-}
-
-export interface GroupResult {
-  cells: CellRef[];
-  size: number;
-  bin: Bin | null;
-  noise: boolean;
-  reason: string | null;
-}
-
-const NEIGHBOURS_4: Array<[number, number]> = [
-  [-1, 0],
-  [1, 0],
-  [0, -1],
-  [0, 1],
-];
-
-const NEIGHBOURS_8: Array<[number, number]> = [
-  ...NEIGHBOURS_4,
-  [-1, -1],
-  [-1, 1],
-  [1, -1],
-  [1, 1],
-];
-
-const MAX_GROUP_CELLS = 10000;
-
-export function binForGroup(cells: CellRef[], store: TileStore, rules: Rules): Bin | null {
-  let sum = 0;
-  let max = 0;
-  for (const { r, c } of cells) {
-    const cell = store.getCell(r, c);
-    if (!cell) return null;
-    sum += cell.digit;
-    max = Math.max(max, cell.digit);
-  }
-  const index =
-    rules.binning.strategy === "DIGIT_SUM_MOD" ? sum % 4 : max % 4;
-  return rules.binning.order[index] ?? null;
-}
-
-export async function collectGroup(
-  store: TileStore,
-  rules: Rules,
-  rows: number,
-  cols: number,
-  start: CellRef,
-  signal?: AbortSignal,
-): Promise<GroupResult> {
-  const startCell = await store.ensureCell(start.r, start.c);
-  if (!startCell) throw new Error("No se pudo cargar el bloque de la celda.");
-  if (startCell.tremor < rules.tremorThreshold) {
-    return { cells: [], size: 0, bin: null, noise: false, reason: null };
-  }
-
-  const offsets = rules.connectivity === 8 ? NEIGHBOURS_8 : NEIGHBOURS_4;
-  const visited = new Set<string>();
-  const cells: CellRef[] = [];
-  const queue: CellRef[] = [{ r: start.r, c: start.c }];
-  const touchedTiles = new Set<string>();
-  visited.add(`${start.r}:${start.c}`);
-
-  const unpin = store.pin([store.tileKeyFor(start.r, start.c)]);
-  try {
-    while (queue.length > 0) {
-      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-      const current = queue.shift();
-      if (!current) break;
-      const cell = await store.ensureCell(current.r, current.c);
-      if (!cell) throw new Error("Se perdió un bloque durante la selección.");
-      if (cell.tremor < rules.tremorThreshold) continue;
-      cells.push(current);
-      touchedTiles.add(store.tileKeyFor(current.r, current.c));
-      if (cells.length > MAX_GROUP_CELLS) {
-        return {
-          cells,
-          size: cells.length,
-          bin: null,
-          noise: true,
-          reason: "El grupo es demasiado grande para refinarse.",
-        };
-      }
-      for (const [dr, dc] of offsets) {
-        const nr = current.r + dr;
-        const nc = current.c + dc;
-        if (nr < 0 || nc < 0 || nr >= rows || nc >= cols) continue;
-        const key = `${nr}:${nc}`;
-        if (visited.has(key)) continue;
-        visited.add(key);
-        const neighbourTile = store.tileKeyFor(nr, nc);
-        if (!store.hasTile(Math.floor(nr / store.tileSize), Math.floor(nc / store.tileSize))) {
-          unpin();
-          const extra = store.pin([neighbourTile]);
-          try {
-            const loaded = await store.ensureCell(nr, nc);
-            if (!loaded) continue;
-          } finally {
-            extra();
-          }
-        }
-        queue.push({ r: nr, c: nc });
-      }
-    }
-  } finally {
-    unpin();
-  }
-
-  const size = cells.length;
-  if (size < rules.minGroupSize || size > rules.maxGroupSize) {
-    return {
-      cells,
-      size,
-      bin: null,
-      noise: true,
-      reason:
-        size < rules.minGroupSize
-          ? `Es ruido: el grupo tiene ${size} celdas y el mínimo es ${rules.minGroupSize}.`
-          : `Es ruido: el grupo tiene ${size} celdas y el máximo es ${rules.maxGroupSize}.`,
-    };
-  }
-
-  const bin = binForGroup(cells, store, rules);
-  return { cells, size, bin, noise: false, reason: null };
 }
 
 export function clampCell(r: number, c: number, rows: number, cols: number): CellRef {
