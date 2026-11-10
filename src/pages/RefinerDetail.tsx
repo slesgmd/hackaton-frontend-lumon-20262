@@ -4,6 +4,8 @@ import { apiRequestWithMeta, isAbortError, messageFor } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { formatDate, safeExternalUrl } from "../lib/format";
 import { useRealtimeEvent } from "../lib/realtime";
+import { isNewer, reconcile } from "../lib/refinerStore";
+import { RefinerSchema, RefinerUpdatedEventSchema } from "../lib/schemasCp4";
 import type { Refiner } from "../lib/types";
 import { ErrorNotice, Loading } from "../components/Loading";
 
@@ -26,9 +28,9 @@ export function RefinerDetailPage(): JSX.Element {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    apiRequestWithMeta<Refiner>(`/refiners/${refinerId}`, { signal: controller.signal })
+    apiRequestWithMeta<unknown>(`/refiners/${refinerId}`, { signal: controller.signal })
       .then((result) => {
-        setRefiner(result.data);
+        setRefiner(reconcile(RefinerSchema.parse(result.data)));
         setEtag(result.etag);
       })
       .catch((caught: unknown) => {
@@ -40,10 +42,17 @@ export function RefinerDetailPage(): JSX.Element {
     return () => controller.abort();
   }, [refinerId, reloadKey]);
 
+  // Solo se aplica si la versión del evento es mayor; se vuelve a pedir para conservar el ETag exacto.
   useRealtimeEvent("refiner.updated", (event) => {
-    const data = event.data as { id?: number } | null;
-    if (data?.id === refinerId) setReloadKey((value) => value + 1);
+    const parsed = RefinerUpdatedEventSchema.safeParse(event.data);
+    if (!parsed.success || parsed.data.id !== refinerId) return;
+    if (!isNewer(refinerId, parsed.data.version)) return;
+    reconcile(parsed.data.refiner);
+    setRefiner(parsed.data.refiner);
+    setEtag(`"${parsed.data.version}"`);
+    setReloadKey((value) => value + 1);
   });
+  useRealtimeEvent("stream.reset", () => setReloadKey((value) => value + 1));
 
   if (loading && !refiner) return <Loading label="Abriendo expediente…" />;
   if (error) {

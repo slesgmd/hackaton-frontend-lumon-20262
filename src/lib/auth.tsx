@@ -82,6 +82,11 @@ function revoke(code: string): void {
   notifyRevoked?.(code);
 }
 
+/** Revoca la sesión local (por ejemplo, ante el evento session.revoked) y avisa a las demás pestañas. */
+export function revokeSession(code: string): void {
+  revoke(code);
+}
+
 /** Un único intento por refresh token; solo 429/503 se reintentan. Nunca se reusa un token tras error de red o 401. */
 async function refreshLocked(stamp: number): Promise<boolean> {
   // Otra pestaña ya renovó mientras esperábamos el lock: usamos su access token.

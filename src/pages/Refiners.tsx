@@ -3,6 +3,9 @@ import { Link, useSearchParams } from "react-router-dom";
 import { apiRequest, isAbortError, messageFor } from "../lib/api";
 import { formatDate, readInt, safeExternalUrl } from "../lib/format";
 import { useRealtimeEvent } from "../lib/realtime";
+import { isNewer, reconcile, reconcileAll } from "../lib/refinerStore";
+import { DepartmentSchema, RefinerPageSchema, RefinerUpdatedEventSchema } from "../lib/schemasCp4";
+import { z } from "zod";
 import type { Department, RefinerPage } from "../lib/types";
 import { ErrorNotice, Loading } from "../components/Loading";
 
@@ -18,7 +21,7 @@ export function RefinersPage(): JSX.Element {
   const rawSize = readInt(params.get("size"), 10);
   const size = isSize(rawSize) ? rawSize : 10;
   const departmentId = params.get("departmentId") ?? "";
-  const query = params.get("q") ?? "";
+  const query = (params.get("q") ?? "").slice(0, 60);
 
   const [search, setSearch] = useState(query);
   const [data, setData] = useState<RefinerPage | null>(null);
@@ -43,14 +46,14 @@ export function RefinersPage(): JSX.Element {
         },
         { replace: true },
       );
-    }, 400);
+    }, 300);
     return () => window.clearTimeout(timer);
   }, [search, query, setParams]);
 
   useEffect(() => {
     const controller = new AbortController();
-    apiRequest<Department[]>("/departments", { signal: controller.signal })
-      .then((result) => setDepartments(result))
+    apiRequest<unknown>("/departments", { signal: controller.signal })
+      .then((result) => setDepartments(z.array(DepartmentSchema).parse(result)))
       .catch(() => undefined);
     return () => controller.abort();
   }, [reloadKey]);
@@ -66,7 +69,11 @@ export function RefinersPage(): JSX.Element {
     searchParams.set("size", String(size));
     if (departmentId) searchParams.set("departmentId", departmentId);
     if (query) searchParams.set("q", query);
-    apiRequest<RefinerPage>(`/refiners?${searchParams.toString()}`, { signal: controller.signal })
+    apiRequest<unknown>(`/refiners?${searchParams.toString()}`, { signal: controller.signal })
+      .then((raw) => {
+        const page = RefinerPageSchema.parse(raw);
+        return { ...page, content: reconcileAll(page.content) } as RefinerPage;
+      })
       .then((result) => {
         if (seq.current !== request) return;
         setData(result);
@@ -91,7 +98,40 @@ export function RefinersPage(): JSX.Element {
     return () => controller.abort();
   }, [page, size, departmentId, query, reloadKey, setParams]);
 
-  useRealtimeEvent("refiner.updated", () => setReloadKey((value) => value + 1));
+  // Un evento solo se aplica si su versión es mayor que la que ya conocemos (stream o HTTP).
+  useRealtimeEvent("refiner.updated", (event) => {
+    const parsed = RefinerUpdatedEventSchema.safeParse(event.data);
+    if (!parsed.success) return;
+    const { id, version, refiner } = parsed.data;
+    if (!isNewer(id, version)) return;
+    const fresh = reconcile(refiner);
+    setData((current) =>
+      current ? { ...current, content: current.content.map((item) => (item.id === id ? fresh : item)) } : current,
+    );
+  });
+  useRealtimeEvent("stream.reset", () => setReloadKey((value) => value + 1));
+
+  // Una URL inválida se normaliza a los valores por defecto con replace.
+  useEffect(() => {
+    const next = new URLSearchParams(params);
+    let changed = false;
+    const drop = (key: string): void => {
+      next.delete(key);
+      changed = true;
+    };
+    const rawPage = params.get("page");
+    if (rawPage !== null && !/^d+$/.test(rawPage)) drop("page");
+    const rawSizeParam = params.get("size");
+    if (rawSizeParam !== null && !isSize(Number(rawSizeParam))) drop("size");
+    const rawDepartment = params.get("departmentId");
+    if (rawDepartment !== null && !/^[1-9]d*$/.test(rawDepartment)) drop("departmentId");
+    const rawQuery = params.get("q");
+    if (rawQuery !== null && rawQuery.length > 60) {
+      next.set("q", rawQuery.slice(0, 60));
+      changed = true;
+    }
+    if (changed) setParams(next, { replace: true });
+  }, [params, setParams]);
 
   const update = (key: string, value: string | null): void => {
     setParams(
