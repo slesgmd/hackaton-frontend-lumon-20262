@@ -319,6 +319,72 @@ export function RefinePage(): JSX.Element {
     return keys;
   }, [selection]);
 
+  // Última intención que falló por red/503/429: se puede reintentar con la MISMA Idempotency-Key y el mismo cuerpo.
+  const [failedIntent, setFailedIntent] = useState<Intent | null>(null);
+
+  const execute = useCallback(
+    async (intent: Intent): Promise<void> => {
+      if (!file || !store) return;
+      try {
+        const { result, replayed } = await submitIntent(file.id, intent);
+        store.setBin(intent.cells, result.bin);
+        setFailedIntent(null);
+        setFile((previous) =>
+          previous
+            ? {
+                ...previous,
+                progress: result.file.progress,
+                refinedGroups: result.file.refinedGroups,
+                totalGroups: result.file.totalGroups,
+                mistakes: result.file.mistakes,
+                status: result.file.status,
+              }
+            : previous,
+        );
+        setActionMessage(
+          `Grupo de ${result.size} celdas llevado a ${BIN_NAME[result.bin]}${replayed ? " (ya estaba registrado)" : ""}.`,
+        );
+        clearSelection(true);
+      } catch (error) {
+        const transient = isApiError(error) && (error.status === 503 || error.status === 429 || error.status === 0);
+        setFailedIntent(transient ? intent : null);
+        if (isApiError(error) && error.status === 409 && error.code === "GROUP_CLAIMED") {
+          const holder = detail<{ displayName?: string }>(error, "holder");
+          setActionError(
+            `Otro refinador${holder?.displayName ? ` (${holder.displayName})` : ""} tiene reservado este grupo. Espera a que lo libere.`,
+          );
+        } else if (isApiError(error) && error.status === 409) {
+          // ALREADY_REFINED: vuelve a pedir los bloques afectados y limpia la selección.
+          const tiles = detail<Array<[number, number]>>(error, "tiles");
+          if (tiles && tiles.length > 0) await store.refreshTiles(tiles);
+          else await store.refreshTilesFor(intent.cells);
+          clearSelection(false);
+          setActionError("Alguna celda ya estaba refinada. Actualizamos los bloques afectados; elige el grupo de nuevo.");
+        } else if (isApiError(error) && error.status === 422 && error.code === "WRONG_BIN") {
+          const mistakes = detail<number>(error, "mistakes");
+          if (mistakes !== null) setFile((previous) => (previous ? { ...previous, mistakes } : previous));
+          setActionError(
+            `Esa no es la caja correcta (${BIN_NAME[intent.bin]}). Lumon anotó el error${mistakes !== null ? `: ${mistakes} en este archivo` : ""}. Revisa la caja sugerida y prueba otra.`,
+          );
+        } else if (isApiError(error) && error.status === 422 && error.code === "GROUP_INVALID") {
+          const reason = detail<string>(error, "reason");
+          const missing = detail<number>(error, "missing");
+          setActionError(
+            reason === "INCOMPLETE"
+              ? `Al grupo le faltan ${missing ?? "algunas"} celdas conectadas. Vuelve a seleccionarlo.`
+              : (reason && GROUP_INVALID_TEXT[reason]) || "El servidor no aceptó este grupo.",
+          );
+          if (reason === "INCOMPLETE" || reason === "BELOW_THRESHOLD") clearSelection(false);
+        } else if (transient) {
+          setActionError("No se pudo confirmar el envío (el servicio está ocupado o sin red). Puede que ya se haya guardado: reintenta con la misma operación.");
+        } else {
+          setActionError(messageFor(error));
+        }
+      }
+    },
+    [file, store, clearSelection],
+  );
+
   const refine = useCallback(
     async (bin: Bin) => {
       // Bloqueo con ref: un doble clic o un doble Enter no envían nada.
@@ -343,62 +409,28 @@ export function RefinePage(): JSX.Element {
         cells: selection.cells.map(({ r, c }) => ({ r, c })),
       };
       try {
-        const { result, replayed } = await submitIntent(file.id, intent);
-        store.setBin(intent.cells, result.bin);
-        setFile((previous) =>
-          previous
-            ? {
-                ...previous,
-                progress: result.file.progress,
-                refinedGroups: result.file.refinedGroups,
-                totalGroups: result.file.totalGroups,
-                mistakes: result.file.mistakes,
-                status: result.file.status,
-              }
-            : previous,
-        );
-        setActionMessage(
-          `Grupo de ${result.size} celdas llevado a ${BIN_NAME[result.bin]}${replayed ? " (ya estaba registrado)" : ""}.`,
-        );
-        clearSelection(true);
-      } catch (error) {
-        if (isApiError(error) && error.status === 409 && error.code === "GROUP_CLAIMED") {
-          const holder = detail<{ displayName?: string }>(error, "holder");
-          setActionError(
-            `Otro refinador${holder?.displayName ? ` (${holder.displayName})` : ""} tiene reservado este grupo. Espera a que lo libere.`,
-          );
-        } else if (isApiError(error) && error.status === 409) {
-          // ALREADY_REFINED: vuelve a pedir los bloques afectados y limpia la selección.
-          const tiles = detail<Array<[number, number]>>(error, "tiles");
-          if (tiles && tiles.length > 0) await store.refreshTiles(tiles);
-          else await store.refreshTilesFor(intent.cells);
-          clearSelection(false);
-          setActionError("Alguna celda ya estaba refinada. Actualizamos los bloques afectados; elige el grupo de nuevo.");
-        } else if (isApiError(error) && error.status === 422 && error.code === "WRONG_BIN") {
-          const mistakes = detail<number>(error, "mistakes");
-          if (mistakes !== null) setFile((previous) => (previous ? { ...previous, mistakes } : previous));
-          setActionError(
-            `Esa no es la caja correcta (${BIN_NAME[bin]}). Lumon anotó el error${mistakes !== null ? `: ${mistakes} en este archivo` : ""}. Revisa la caja sugerida y prueba otra.`,
-          );
-        } else if (isApiError(error) && error.status === 422 && error.code === "GROUP_INVALID") {
-          const reason = detail<string>(error, "reason");
-          const missing = detail<number>(error, "missing");
-          setActionError(
-            reason === "INCOMPLETE"
-              ? `Al grupo le faltan ${missing ?? "algunas"} celdas conectadas. Vuelve a seleccionarlo.`
-              : (reason && GROUP_INVALID_TEXT[reason]) || "El servidor no aceptó este grupo.",
-          );
-          if (reason === "INCOMPLETE" || reason === "BELOW_THRESHOLD") clearSelection(false);
-        } else {
-          setActionError(messageFor(error));
-        }
+        await execute(intent);
       } finally {
         busyRef.current = false;
         setBusy(false);
       }
     },
-    [selection, file, store, canRefine, selectedClaim, clearSelection, strategyError],
+    [selection, file, store, canRefine, selectedClaim, strategyError, execute],
   );
+
+  /** Reintento de la MISMA intención: misma Idempotency-Key, mismo cuerpo. */
+  const retryFailed = useCallback(async () => {
+    if (busyRef.current || !failedIntent) return;
+    busyRef.current = true;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await execute(failedIntent);
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }, [failedIntent, execute]);
 
   // Teclas 1 a 4 llevan el grupo seleccionado a cada caja; Escape cancela la selección.
   useEffect(() => {
@@ -650,7 +682,7 @@ export function RefinePage(): JSX.Element {
       </div>
 
       {selectError ? <ErrorNotice message={selectError} /> : null}
-      {actionError ? <ErrorNotice message={actionError} /> : null}
+      {actionError ? <ErrorNotice message={actionError} onRetry={failedIntent ? () => void retryFailed() : undefined} /> : null}
       {actionMessage ? (
         <p role="status" className="rounded border border-lumon-mint/40 bg-lumon-mint/10 p-3 text-sm text-lumon-mint">
           {actionMessage}
