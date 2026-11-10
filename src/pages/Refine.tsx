@@ -402,6 +402,7 @@ export function RefinePage(): JSX.Element {
       setBusy(true);
       setActionError(null);
       setActionMessage(null);
+      setFailedIntent(null);
       // Una key por intención del usuario (esta pulsación), creada una sola vez.
       const intent: Intent = {
         key: crypto.randomUUID(),
@@ -682,7 +683,17 @@ export function RefinePage(): JSX.Element {
       </div>
 
       {selectError ? <ErrorNotice message={selectError} /> : null}
-      {actionError ? <ErrorNotice message={actionError} onRetry={failedIntent ? () => void retryFailed() : undefined} /> : null}
+      {actionError ? <ErrorNotice message={actionError} /> : null}
+      {failedIntent && actionError ? (
+        <button
+          type="button"
+          onClick={() => void retryFailed()}
+          disabled={busy}
+          className="rounded border border-lumon-danger/50 px-3 py-1 text-sm text-lumon-danger underline disabled:opacity-50"
+        >
+          Reintentar envío
+        </button>
+      ) : null}
       {actionMessage ? (
         <p role="status" className="rounded border border-lumon-mint/40 bg-lumon-mint/10 p-3 text-sm text-lumon-mint">
           {actionMessage}
