@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ErrorNotice, Loading } from "../components/Loading";
+import { FloorMembers } from "../components/FloorMembers";
 import { VirtualGrid } from "../components/VirtualGrid";
 import { apiRequest, apiRequestWithMeta, isAbortError, isApiError, messageFor } from "../lib/api";
 import { useAuth } from "../lib/auth";
@@ -282,13 +283,22 @@ export function RefinePage(): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Al caerse el piso las reservas se pierden: se limpia el estado para poder pedir la reserva de nuevo al reconectar.
+  useEffect(() => {
+    if (floor.status !== "open") {
+      setClaimInfo(null);
+      claimRequest.current = null;
+      setClaimPending(false);
+    }
+  }, [floor.status]);
+
   const claimsByCell = useMemo(() => {
     const map = new Map<string, { userId: number; displayName: string }>();
     const names = new Map(floor.members.map((member) => [member.userId, member.displayName]));
     for (const claim of floor.claims) {
       if (claim.claimId === claimInfo?.claimId) continue;
       if (claim.userId === user?.id) continue;
-      const name = names.get(claim.userId) ?? `Refinador ${claim.userId}`;
+      const name = claim.displayName ?? names.get(claim.userId) ?? `Refinador ${claim.userId}`;
       for (const cell of claim.cells) map.set(`${cell.r}:${cell.c}`, { userId: claim.userId, displayName: name });
     }
     return map;
@@ -688,7 +698,7 @@ export function RefinePage(): JSX.Element {
         threshold={rules.tremorThreshold}
         selected={selectedKeys}
         claims={claimsByCell}
-        cursors={floor.cursors}
+        cursorStore={floor.cursorStore}
         focus={focus}
         initialCell={initialCell}
         onFocusChange={onFocusChange}
@@ -698,34 +708,12 @@ export function RefinePage(): JSX.Element {
       />
 
       <div className="grid gap-3 md:grid-cols-2">
-        <div className="rounded border border-lumon-line bg-lumon-panel p-3">
-          <h2 className="text-sm font-semibold text-lumon-mint">Refinadores en el piso</h2>
-          <ul className="mt-2 space-y-1 text-xs text-lumon-mint/70">
-            {floor.members.length === 0 ? <li>Nadie más conectado.</li> : null}
-            {floor.members.map((member) => {
-              const cursor = floor.cursors.find((item) => item.userId === member.userId);
-              return (
-                <li key={member.userId} className="flex items-center justify-between gap-2">
-                  <span>
-                    {member.displayName}
-                    {member.userId === user?.id ? " (tú)" : ""}
-                  </span>
-                  {cursor ? (
-                    <button
-                      type="button"
-                      onClick={() => setFocus({ r: cursor.r, c: cursor.c })}
-                      className="rounded border border-lumon-line px-2 py-0.5 text-[11px]"
-                    >
-                      Ir a {cursor.r + 1},{cursor.c + 1}
-                    </button>
-                  ) : (
-                    <span className="text-lumon-mint/40">sin cursor</span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-        </div>
+        <FloorMembers
+          members={floor.members}
+          store={floor.cursorStore}
+          selfId={user?.id ?? null}
+          onGo={(cell) => setFocus(cell)}
+        />
         <div className="rounded border border-lumon-line bg-lumon-panel p-3 text-xs text-lumon-mint/60">
           <h2 className="text-sm font-semibold text-lumon-mint">Controles</h2>
           <p className="mt-2">Flechas mueven el foco; PageUp/PageDown saltan una página; Home/End van al borde de la fila; Ctrl+Home/End al inicio y al final.</p>

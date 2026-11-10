@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type JSX } from "react";
 import { BIN_NAME, binFromChar } from "../lib/format";
+import { CursorLayer } from "./CursorLayer";
+import type { CursorStore } from "../lib/floor";
 import { clampCell, type TileStore } from "../lib/grid";
 import { chooseCellSize, computeRange, inRange } from "../lib/viewport";
-import type { CellRef, FloorCursor } from "../lib/types";
+import type { CellRef } from "../lib/types";
 
 const OVERSCAN = 3;
 
@@ -18,7 +20,8 @@ interface VirtualGridProps {
   threshold: number;
   selected: Set<string>;
   claims: Map<string, ClaimInfo>;
-  cursors: FloorCursor[];
+  /** Cursores ajenos: viven en un store externo y se pintan en su propia capa (sin re-renderizar la grilla). */
+  cursorStore?: CursorStore;
   focus: CellRef;
   /** Celda que debe quedar arriba a la izquierda al abrir (viene de ?r=&c=). */
   initialCell: CellRef;
@@ -51,7 +54,7 @@ export function VirtualGrid({
   threshold,
   selected,
   claims,
-  cursors,
+  cursorStore,
   focus,
   initialCell,
   onFocusChange,
@@ -301,8 +304,6 @@ export function VirtualGrid({
     }
   }
 
-  const visibleCursors = range ? cursors.filter((cursor) => inRange(range, cursor.r, cursor.c)) : [];
-
   return (
     <div
       ref={viewportRef}
@@ -322,16 +323,7 @@ export function VirtualGrid({
     >
       <div style={{ width: cols * cellSize, height: rows * cellSize, position: "relative" }}>
         {rowElements}
-        {visibleCursors.map((cursor) => (
-          <div
-            key={`cursor-${cursor.userId}`}
-            className="pointer-events-none absolute z-30 rounded border border-lumon-amber/80 bg-lumon-amber/20 px-1 text-[9px] text-lumon-amber"
-            style={{ left: cursor.c * cellSize, top: cursor.r * cellSize }}
-            aria-hidden="true"
-          >
-            {cursor.displayName?.slice(0, 8) ?? `U${cursor.userId}`}
-          </div>
-        ))}
+        {cursorStore ? <CursorLayer store={cursorStore} cellSize={cellSize} /> : null}
       </div>
     </div>
   );
