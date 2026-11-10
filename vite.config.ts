@@ -25,14 +25,17 @@ function securityHeaders(env: Record<string, string>): Plugin {
         const value = env[key];
         if (value) connect.add(new URL(value).origin);
       }
+      const images = new Set<string>(["'self'", "data:", "blob:"]);
       if ((env.VITE_STORAGE_PROVIDER ?? "").toUpperCase() === "CLOUDINARY") {
-        connect.add("https://api.cloudinary.com");
+        connect.add("https://api.cloudinary.com"); // subida unsigned
+        images.add("https://res.cloudinary.com"); // entrega
       }
+      if (env.VITE_SUPABASE_URL) images.add(new URL(env.VITE_SUPABASE_URL).origin);
       const csp = [
         "default-src 'self'",
         "script-src 'self'",
         "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data: blob: https:",
+        `img-src ${[...images].join(" ")}`,
         "font-src 'self'",
         `connect-src ${[...connect].join(" ")}`,
         "object-src 'none'",

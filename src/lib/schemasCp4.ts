@@ -28,7 +28,7 @@ export const RefinerPageSchema = z.object({
 });
 
 export const MediaConstraintsSchema = z.object({
-  contentType: z.string(),
+  contentType: z.literal("image/webp"),
   width: z.number().optional(),
   height: z.number().optional(),
   minLongSide: z.number().optional(),

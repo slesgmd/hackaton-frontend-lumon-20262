@@ -17,6 +17,9 @@ const RefinePage = page(() => import("./pages/Refine"), "RefinePage");
 const RefinersPage = page(() => import("./pages/Refiners"), "RefinersPage");
 const RefinerDetailPage = page(() => import("./pages/RefinerDetail"), "RefinerDetailPage");
 const RefinerEditPage = page(() => import("./pages/RefinerEdit"), "RefinerEditPage");
+const RefinerBadgePage = page(() => import("./pages/RefinerBadge"), "RefinerBadgePage");
+const IncidentsPage = page(() => import("./pages/Incidents"), "IncidentsPage");
+const IncidentNewPage = page(() => import("./pages/IncidentNew"), "IncidentNewPage");
 const EstadoPage = page(() => import("./pages/Estado"), "EstadoPage");
 const NotFoundPage = page(() => import("./pages/NotFound"), "NotFoundPage");
 
@@ -44,15 +47,6 @@ function Guarded({
     <Shell title={title}>
       {permission ? <ProtectedRoute permission={permission}>{children}</ProtectedRoute> : <>{children}</>}
     </Shell>
-  );
-}
-
-function Placeholder({ title, note }: { title: string; note: string }): JSX.Element {
-  return (
-    <section>
-      <h1 className="text-xl font-semibold text-lumon-mint">{title}</h1>
-      <p className="mt-2 text-sm text-lumon-mint/70">{note}</p>
-    </section>
   );
 }
 
@@ -131,10 +125,26 @@ export default function App(): JSX.Element {
           }
         />
         <Route
+          path="/refiners/:id/badge"
+          element={
+            <Guarded title="Fotocheck" permission="media:upload">
+              <RefinerBadgePage />
+            </Guarded>
+          }
+        />
+        <Route
           path="/incidents"
           element={
             <Guarded title="Incidentes" permission="incidents:read">
-              <Placeholder title="Incidentes" note="Disponible en el CP4." />
+              <IncidentsPage />
+            </Guarded>
+          }
+        />
+        <Route
+          path="/incidents/new"
+          element={
+            <Guarded title="Nuevo reporte" permission="incidents:create">
+              <IncidentNewPage />
             </Guarded>
           }
         />
