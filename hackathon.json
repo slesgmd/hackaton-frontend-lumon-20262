@@ -1,11 +1,20 @@
 {
-  "teamCode": "TEAM-000",
-  "teamName": "Nombre",
-  "deployUrl": "https://",
+  "teamCode": "TEAM-056",
+  "teamName": "maltin power",
+  "deployUrl": "https://hackaton-frontend-lumon-20262.pages.dev",
   "storageProvider": "CLOUDINARY",
   "integrantes": [
-    { "nombre": "Joel Rodrigo Eulogio Coquil", "codigo": "202510112" },
-    { "nombre": "Sebastian Lescano", "codigo": "202510247" },
-    { "nombre": "Francisco  ", "codigo": "201910540" }
+    {
+      "nombre": "Joel Rodrigo Eulogio Coquil",
+      "codigo": "202510112"
+    },
+    {
+      "nombre": "Sebastian Lescano",
+      "codigo": "202510247"
+    },
+    {
+      "nombre": "Francisco Lira",
+      "codigo": "201910540"
+    }
   ]
 }
