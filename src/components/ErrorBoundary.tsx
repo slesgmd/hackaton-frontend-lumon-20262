@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { isChunkError, reloadOnce } from "../lib/reload";
 
 interface Props {
   children: ReactNode;
@@ -17,6 +18,8 @@ export class ErrorBoundary extends Component<Props, State> {
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
     console.error("Error de render", error, info);
+    // Un módulo de una versión anterior ya no existe: recarga una sola vez para tomar la versión nueva.
+    if (isChunkError(error)) reloadOnce();
   }
 
   render(): ReactNode {
@@ -26,7 +29,9 @@ export class ErrorBoundary extends Component<Props, State> {
           <div className="max-w-lg rounded-lg border border-lumon-danger/50 bg-lumon-panel p-6">
             <h1 className="text-lg font-semibold text-lumon-danger">Algo falló en el piso</h1>
             <p className="mt-2 text-sm text-lumon-mint/80">
-              La ruta no pudo renderizarse. El resto de la consola sigue disponible.
+              {isChunkError(this.state.error)
+                ? "Hay una versión nueva de la consola. Recarga la página para continuar."
+                : "La ruta no pudo renderizarse. El resto de la consola sigue disponible."}
             </p>
             <p className="mt-3 break-words font-mono text-xs text-lumon-mint/50">{this.state.error.message}</p>
             <div className="mt-5 flex gap-3">

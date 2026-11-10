@@ -6,7 +6,14 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { HealthGate } from "./components/HealthGate";
 import { AuthProvider } from "./lib/auth";
 import { RealtimeProvider } from "./lib/realtime";
+import { clearReloadMarkLater, reloadOnce } from "./lib/reload";
 import "./index.css";
+
+window.addEventListener("vite:preloadError", (event) => {
+  event.preventDefault();
+  reloadOnce();
+});
+clearReloadMarkLater();
 
 const root = document.getElementById("root");
 if (!root) throw new Error("No se encontró #root");

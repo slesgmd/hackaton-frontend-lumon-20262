@@ -41,6 +41,15 @@ function securityHeaders(env: Record<string, string>): Plugin {
         "frame-ancestors 'none'",
       ].join("; ");
       const headers = [
+        "/",
+        "  Cache-Control: no-cache",
+        "",
+        "/index.html",
+        "  Cache-Control: no-cache",
+        "",
+        "/assets/*",
+        "  Cache-Control: public, max-age=31536000, immutable",
+        "",
         "/*",
         `  Content-Security-Policy: ${csp}`,
         "  X-Content-Type-Options: nosniff",
